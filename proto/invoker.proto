@@ -1,0 +1,123 @@
+syntax = "proto3";
+
+package invoker.v1;
+
+option go_package = "podtest/invoker/v1;invokerv1";
+
+// Invoker exposes one bidirectional stream per run.  The client first sends a
+// RunStart message, then zero or more archive chunks, then RunArchiveEnd.  The
+// server starts the Lua runner as soon as the archive is complete and streams
+// events until the run finishes.  Sending RunStop cancels the run immediately.
+//
+// Authentication: every call must carry the configured token in the
+// `authorization: Bearer <token>` metadata header (or `x-invoker-token`).
+service Invoker {
+  rpc Run(stream RunRequest) returns (stream RunEvent);
+}
+
+message RunRequest {
+  oneof payload {
+    RunStart start = 1;
+    bytes archive_chunk = 2;
+    RunArchiveEnd archive_end = 3;
+    RunStop stop = 4;
+  }
+}
+
+message RunStart {
+  // Stable identifier chosen by the backend.  It must be unique for the
+  // lifetime of the invoker process and is used as the run directory name.
+  string run_id = 1;
+  // Entry script inside the extracted archive.  Defaults to runner.lua.
+  string runner = 2;
+  // Optional per-run timeout in milliseconds; 0 means the configured default.
+  uint64 timeout_ms = 3;
+}
+
+message RunArchiveEnd {}
+
+message RunStop {
+  string reason = 1;
+}
+
+message RunEvent {
+  oneof payload {
+    // A complete event that fits into one gRPC message.
+    Event event = 1;
+    // A fragment of a serialised Event.  Fragments for one event are sent
+    // consecutively; concatenate `data` in `sequence` order until `total`
+    // fragments have been received, then parse the result as Event.
+    EventChunk chunk = 2;
+  }
+}
+
+message EventChunk {
+  uint32 sequence = 1;
+  uint32 total = 2;
+  bytes data = 3;
+}
+
+message Event {
+  oneof event {
+    RunStarted run_started = 1;
+    TestStarted test_started = 2;
+    TestVerdict test_verdict = 3;
+    SubgroupScore subgroup_score = 4;
+    ProblemScore problem_score = 5;
+    BuildLog build_log = 6;
+    TestStdio test_stdio = 7;
+    RunnerError runner_error = 8;
+    RunFinished run_finished = 9;
+    RunTimeout run_timeout = 10;
+  }
+}
+
+message RunStarted {
+  string run_id = 1;
+  string instance_id = 2;
+}
+
+message TestStarted {
+  uint32 n = 1;
+}
+
+message TestVerdict {
+  uint32 n = 1;
+  string verdict = 2;
+  optional double score = 3;
+  bytes grader_data = 4;
+}
+
+message SubgroupScore {
+  string id = 1;
+  double score = 2;
+  bytes grader_data = 3;
+}
+
+message ProblemScore {
+  double score = 1;
+  bytes grader_data = 2;
+}
+
+message BuildLog {
+  string text = 1;
+}
+
+message TestStdio {
+  uint32 n = 1;
+  bytes stdin = 2;
+  bytes stdout = 3;
+  bytes stderr = 4;
+}
+
+message RunnerError {
+  string message = 1;
+  string traceback = 2;
+}
+
+message RunFinished {
+  bool ok = 1;
+  string status = 2;
+}
+
+message RunTimeout {}
