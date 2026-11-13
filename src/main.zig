@@ -28,6 +28,7 @@ const Options = struct {
     run_timeout_sec: ?u64 = null,
     history_limit: ?u64 = null,
     max_concurrent: ?u32 = null,
+    keep_run_dirs: bool = false,
     no_calibration: bool = false,
     help: bool = false,
 };
@@ -49,10 +50,11 @@ fn usage() void {
         \\  --run-timeout-sec N        default run timeout (default 300)
         \\  --history-limit BYTES      per-stream stdio history limit (default 512MiB)
         \\  --max-concurrent N         limit concurrent runs (0 = unlimited)
+        \\  --keep-run-dirs            keep <work_root>/<run_id> after a run ends
         \\  --no-calibration           skip the CPU benchmark at startup
         \\  --help                     show this help
         \\
-        \\Environment: PODTEST_INVOKER_TOKEN, XDG_DATA_HOME, XDG_RUNTIME_DIR
+        \\Environment: PODTEST_INVOKER_TOKEN, PODTEST_INVOKER_LISTEN, XDG_DATA_HOME, XDG_RUNTIME_DIR
         \\
     ;
     std.debug.print("{s}", .{text});
@@ -93,6 +95,8 @@ fn parseArgs(args: []const [*:0]const u8) !Options {
             o.history_limit = try std.fmt.parseInt(u64, try argValue(args, &i), 10);
         } else if (std.mem.eql(u8, a, "--max-concurrent")) {
             o.max_concurrent = try std.fmt.parseInt(u32, try argValue(args, &i), 10);
+        } else if (std.mem.eql(u8, a, "--keep-run-dirs")) {
+            o.keep_run_dirs = true;
         } else if (std.mem.eql(u8, a, "--no-calibration")) {
             o.no_calibration = true;
         } else {
@@ -171,8 +175,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
         cfg.stdio_history_limit = @intCast(v);
     }
     if (opts.max_concurrent) |v| cfg.max_concurrent_runs = v;
+    if (opts.keep_run_dirs) cfg.keep_run_dirs = true;
 
     log.setLevel(cfg.log_level);
+    if (cfg.keep_run_dirs) log.info("run directories are kept after completion", .{});
 
     const data_dir = defaultDataDir() orelse return error.OutOfMemory;
     defer gpa.free(data_dir);

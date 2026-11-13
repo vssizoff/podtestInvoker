@@ -23,3 +23,4 @@ test {
     std.testing.refAllDecls(@import("grpc/messages.zig"));
     std.testing.refAllDecls(@import("grpc/server.zig"));
 }
+// All unit tests are discovered through refAllDecls above.

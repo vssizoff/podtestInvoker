@@ -17,7 +17,8 @@ Podman API socket.
 - Secure task-archive extraction (`..`, absolute paths and symlink escapes are
   rejected).
 - Per-run directories, per-run timeouts, immediate cancellation, startup
-  cleanup of orphaned resources.
+  cleanup of orphaned resources.  Run directories are removed when a run
+  finishes; set `keep_run_dirs` (or `--keep-run-dirs`) to keep them.
 - Container stdout/stderr capture with a bounded 512 MiB history per stream,
   streaming and pipe modes.
 - cgroup v2 CPU and memory accounting; CPU time normalised by a deterministic
@@ -140,6 +141,7 @@ defaults below; CLI flags override the file.
 | `grpc_max_message_bytes` | `67108864` (64 MiB) | Maximum inbound gRPC message. |
 | `event_chunk_bytes` | `1048576` (1 MiB) | Events larger than this are split into chunks. |
 | `max_concurrent_runs` | `0` (unlimited) | Active runs across all connections. |
+| `keep_run_dirs` | `false` | Keep `<work_root>/<run_id>` after a run finishes. |
 | `log_level` | `info` | `debug`, `info`, `warn`, `error`. |
 
 Example:
@@ -174,6 +176,7 @@ Example:
 --run-timeout-sec N      default run timeout (default 300)
 --history-limit BYTES    per-stream stdio history limit (default 512 MiB)
 --max-concurrent N       limit concurrent runs (0 = unlimited)
+--keep-run-dirs          keep <work_root>/<run_id> after a run ends
 --no-calibration         skip the CPU benchmark at startup
 --help
 ```

@@ -69,7 +69,9 @@ chunk before `RunStart`, terminates the RPC with `INVALID_ARGUMENT`.
 
 The run directory is `<work_root>/<run_id>/`; the archive contents are
 extracted at its root.  A `solution/` directory in the archive is therefore
-available to the runner as `solution/...`.
+available to the runner as `solution/...`.  The directory is removed when the
+run finishes (containers are stopped and removed first); set `keep_run_dirs` in
+the configuration or pass `--keep-run-dirs` to keep it for inspection.
 
 ### 3. Events
 

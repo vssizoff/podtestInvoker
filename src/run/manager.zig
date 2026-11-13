@@ -174,7 +174,7 @@ pub const Manager = struct {
         };
         var root_owned = true;
         errdefer if (root_owned) sys.close(rootfd);
-        errdefer self.removePrepared(run_id);
+        errdefer self.removeRunDir(run_id);
 
         tar.extract(archive_path, rootfd) catch |e| {
             log.warn("run {s}: archive extraction failed: {s}", .{ run_id, @errorName(e) });
@@ -251,7 +251,7 @@ pub const Manager = struct {
         }, 0);
     }
 
-    fn removePrepared(self: *Manager, run_id: []const u8) void {
+    fn removeRunDir(self: *Manager, run_id: []const u8) void {
         var wb: [fs.max_path + 1]u8 = undefined;
         if (self.cfg.work_root.len + 1 > wb.len) return;
         @memcpy(wb[0..self.cfg.work_root.len], self.cfg.work_root);
@@ -269,6 +269,9 @@ pub const Manager = struct {
         executor.execute(h.rt, .{ .runner = h.runner });
         h.done.store(true, .release);
         h.mgr.removeRun(h.id);
+        // The runner is finished and every report has been emitted, so the run
+        // directory is garbage unless the operator asked to keep it.
+        if (!h.mgr.cfg.keep_run_dirs) h.mgr.removeRunDir(h.id);
         log.info("run {s}: finished", .{h.id});
     }
 };

@@ -18,6 +18,7 @@ pub const Config = struct {
     grpc_max_message: usize = 64 * 1024 * 1024,
     event_chunk: usize = 1024 * 1024,
     max_concurrent_runs: u32 = 0,
+    keep_run_dirs: bool = false,
     log_level: log.Level = .info,
     podman_api: []const u8 = "v4.0.0",
 
@@ -61,6 +62,15 @@ fn getString(obj: std.json.ObjectMap, name: []const u8) ?[]const u8 {
     const v = obj.get(name) orelse return null;
     return switch (v) {
         .string => |s| s,
+        else => null,
+    };
+}
+
+fn getBool(obj: std.json.ObjectMap, name: []const u8) ?bool {
+    const v = obj.get(name) orelse return null;
+    return switch (v) {
+        .bool => |b| b,
+        .integer => |i| i != 0,
         else => null,
     };
 }
@@ -138,5 +148,103 @@ pub fn load(path: []const u8) !Config {
     if (getString(obj, "log_level")) |s| {
         cfg.log_level = log.Level.parse(s) orelse return error.InvalidLogLevel;
     }
+    if (getBool(obj, "keep_run_dirs")) |b| cfg.keep_run_dirs = b;
     return cfg;
+}
+
+test "load reads every documented field and validate rejects bad values" {
+    const linux = std.os.linux;
+    const sys = @import("util/sys.zig");
+
+    var dir_buf: [256]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&dir_buf, "/tmp/opencode/podtest-config-{d}", .{linux.getpid()});
+    try fs.makeDirAllAbsolute(dir);
+    defer {
+        var pb: [fs.max_path + 1]u8 = undefined;
+        const parent = fs.dirName(dir);
+        if (parent.len + 1 <= pb.len) {
+            @memcpy(pb[0..parent.len], parent);
+            pb[parent.len] = 0;
+            if (sys.openat(linux.AT.FDCWD, pb[0..parent.len :0], .{
+                .ACCMODE = .RDONLY,
+                .DIRECTORY = true,
+                .CLOEXEC = true,
+            }, 0)) |pfd| {
+                fs.removeTreeBeneath(pfd, fs.baseName(dir)) catch {};
+                sys.close(pfd);
+            } else |_| {}
+        }
+    }
+
+    const good =
+        \\{
+        \\  "podman_socket": "/run/user/1000/podman/podman.sock",
+        \\  "listen": "127.0.0.1:50051",
+        \\  "token": "secret",
+        \\  "work_root": "/var/lib/invoker/runs",
+        \\  "state_file": "/var/lib/invoker/state.json",
+        \\  "podman_api": "v4.0.0",
+        \\  "run_timeout_sec": 42,
+        \\  "stdio_history_limit_bytes": 4096,
+        \\  "stop_grace_ms": 250,
+        \\  "calibration_runs": 3,
+        \\  "calibration_interval_sec": 60,
+        \\  "grpc_max_message_bytes": 2097152,
+        \\  "event_chunk_bytes": 1024,
+        \\  "max_concurrent_runs": 7,
+        \\  "keep_run_dirs": true,
+        \\  "log_level": "debug"
+        \\}
+    ;
+    const good_path = try std.fmt.allocPrint(gpa, "{s}/good.json", .{dir});
+    defer gpa.free(good_path);
+    try fs.writeFileAbsolute(good_path, good);
+
+    var cfg = try load(good_path);
+    defer cfg.deinit();
+    try std.testing.expectEqualStrings("127.0.0.1:50051", cfg.listen);
+    try std.testing.expectEqualStrings("secret", cfg.token);
+    try std.testing.expectEqualStrings("/var/lib/invoker/runs", cfg.work_root);
+    try std.testing.expectEqual(@as(u64, 42_000), cfg.run_timeout_ms);
+    try std.testing.expectEqual(@as(usize, 4096), cfg.stdio_history_limit);
+    try std.testing.expectEqual(@as(u64, 250), cfg.stop_grace_ms);
+    try std.testing.expectEqual(@as(u32, 3), cfg.calibration_runs);
+    try std.testing.expectEqual(@as(u64, 60_000), cfg.calibration_interval_ms);
+    try std.testing.expectEqual(@as(usize, 2 * 1024 * 1024), cfg.grpc_max_message);
+    try std.testing.expectEqual(@as(usize, 1024), cfg.event_chunk);
+    try std.testing.expectEqual(@as(u32, 7), cfg.max_concurrent_runs);
+    try std.testing.expect(cfg.keep_run_dirs);
+    try std.testing.expectEqual(log.Level.debug, cfg.log_level);
+    try cfg.validate();
+
+    // Defaults are used for fields that are absent from the file.
+    const minimal_path = try std.fmt.allocPrint(gpa, "{s}/minimal.json", .{dir});
+    defer gpa.free(minimal_path);
+    try fs.writeFileAbsolute(minimal_path,
+        \\{ "listen": "0.0.0.0:1", "token": "t", "work_root": "/w", "state_file": "/s" }
+    );
+    var min_cfg = try load(minimal_path);
+    defer min_cfg.deinit();
+    try std.testing.expectEqual(@as(u64, 300_000), min_cfg.run_timeout_ms);
+    try std.testing.expectEqual(@as(usize, 512 * 1024 * 1024), min_cfg.stdio_history_limit);
+    try std.testing.expectEqual(@as(usize, 1024 * 1024), min_cfg.event_chunk);
+    try std.testing.expectEqual(@as(u32, 0), min_cfg.max_concurrent_runs);
+    try std.testing.expect(!min_cfg.keep_run_dirs);
+    try std.testing.expectEqualStrings("v4.0.0", min_cfg.podman_api);
+    try min_cfg.validate();
+
+    // An event chunk larger than the message limit is rejected by validate.
+    const bad_path = try std.fmt.allocPrint(gpa, "{s}/bad.json", .{dir});
+    defer gpa.free(bad_path);
+    try fs.writeFileAbsolute(bad_path,
+        \\{ "listen": "0.0.0.0:1", "token": "t", "work_root": "/w", "state_file": "/s",
+        \\  "grpc_max_message_bytes": 1024, "event_chunk_bytes": 4096 }
+    );
+    var bad_cfg = try load(bad_path);
+    defer bad_cfg.deinit();
+    try std.testing.expectError(error.InvalidChunkSize, bad_cfg.validate());
+
+    const missing_path = try std.fmt.allocPrint(gpa, "{s}/missing.json", .{dir});
+    defer gpa.free(missing_path);
+    try std.testing.expectError(error.NotFound, load(missing_path));
 }
