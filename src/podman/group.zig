@@ -1,5 +1,6 @@
 const std = @import("std");
-const podman = @import("client.zig");
+const podman = @import("podman");
+const janitor = @import("janitor");
 const resource = @import("resource");
 const stdio = @import("history");
 const pipe = @import("pipe");
@@ -24,11 +25,13 @@ pub const Realtime = struct {
 pub const Link = struct { from: usize, to: usize };
 pub const PeerPolicy = enum { close_edge, stop_group };
 pub const EdgeResult = enum { eof, broken_pipe, cancelled };
+pub const Ownership = struct { journal: janitor.Journal, run_id: []const u8 };
 pub const Options = struct {
     wall_ms: u64,
     history_limit: u64,
     peer_policy: PeerPolicy = .close_edge,
     cancellation: ?podman.Cancellation = null,
+    ownership: ?Ownership = null,
 };
 pub const Result = struct { exit: resource.Exit, metrics: ?resource.Metrics };
 
@@ -36,6 +39,7 @@ const max_nodes = 8;
 const Edge = struct { queue: pipe.Buffer, result: ?EdgeResult = null };
 const Active = struct {
     id: ?podman.Id = null,
+    intent: ?janitor.Record = null,
     attach: ?podman.Attach = null,
     watchdog: ?resource.Watchdog = null,
     cgroup: ?std.Io.Dir = null,
@@ -84,9 +88,15 @@ pub fn run(a: std.mem.Allocator, io: std.Io, client: podman.Client, nodes: []con
     defer for (active) |*entry| {
         if (entry.attach) |*stream| stream.close();
         if (entry.cgroup) |dir| dir.close(io);
-        if (entry.id) |id| client.remove(id) catch |err| {
-            if (err != error.PodmanNotFound) std.log.err("group container cleanup failed: {s}", .{@errorName(err)});
-        };
+        if (entry.id) |id| {
+            const removed = if (client.remove(id)) true else |err| blk: {
+                if (err != error.PodmanNotFound) std.log.err("group container cleanup failed: {s}", .{@errorName(err)});
+                break :blk err == error.PodmanNotFound;
+            };
+            if (removed) if (entry.intent) |intent| options.ownership.?.journal.finish(intent) catch |err| {
+                std.log.err("group container journal cleanup failed: {s}", .{@errorName(err)});
+            };
+        }
     };
     const deadline = try resource.Watchdog.start(now(io), options.wall_ms);
     try checkSetup(io, deadline, options);
@@ -95,6 +105,14 @@ pub fn run(a: std.mem.Allocator, io: std.Io, client: podman.Client, nodes: []con
         var spec = node.spec;
         spec.stdin = node.modes[0] != .none;
         spec.live_io = true;
+        var name: janitor.Name = undefined;
+        if (options.ownership) |owner| {
+            entry.intent = try owner.journal.reserve(a, owner.run_id);
+            const intent = &entry.intent.?;
+            name = intent.name();
+            spec.name = &name;
+            spec.labels = intent.labels();
+        }
         entry.id = try client.createWithLimits(a, spec, node.limits);
         try checkSetup(io, deadline, options);
         try client.initContainer(entry.id.?);
@@ -194,6 +212,7 @@ pub fn run(a: std.mem.Allocator, io: std.Io, client: podman.Client, nodes: []con
         entry.attach.?.close();
         try client.remove(entry.id.?);
         entry.id = null;
+        if (entry.intent) |intent| try options.ownership.?.journal.finish(intent);
     }
     for (edges[0..links.len], edge_results) |edge, *result| result.* = edge.result orelse .broken_pipe;
 }

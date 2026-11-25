@@ -193,22 +193,52 @@ int podtest_control_complete(void *channel, struct identity *id, char *artifact)
     return 0;
 }
 
-size_t podtest_encode_artifact_event(struct identity *id, char *submission, char *artifact,
+static size_t encode_event(Podtest__Invoker__V1__Event event, struct identity *id, char *submission,
         unsigned char event_id[16], uint64_t sequence, int64_t timestamp, unsigned char *out, size_t capacity) {
-    Podtest__Invoker__V1__Event event = PODTEST__INVOKER__V1__EVENT__INIT;
     event.event_id = (ProtobufCBinaryData){16, event_id};
     event.attempt_id = id->attempt;
     event.run_id = id->run;
     event.invoker_id = id->invoker;
     event.fencing_token = (ProtobufCBinaryData){32, id->token};
     event.submission_id = submission;
-    event.artifact_id = artifact;
     event.sequence = sequence;
     event.schema_version = 1;
     event.occurred_at_unix_millis = timestamp;
-    event.kind = PODTEST__INVOKER__V1__EVENT__KIND__ARTIFACT_CREATED;
     if (podtest__invoker__v1__event__get_packed_size(&event) > capacity) return 0;
     return podtest__invoker__v1__event__pack(&event, out);
+}
+
+size_t podtest_encode_artifact_event(struct identity *id, char *submission, char *artifact,
+        unsigned char event_id[16], uint64_t sequence, int64_t timestamp, unsigned char *out, size_t capacity) {
+    Podtest__Invoker__V1__Event event = PODTEST__INVOKER__V1__EVENT__INIT;
+    event.kind = PODTEST__INVOKER__V1__EVENT__KIND__ARTIFACT_CREATED;
+    event.artifact_id = artifact;
+    return encode_event(event, id, submission, event_id, sequence, timestamp, out, capacity);
+}
+
+struct result_fields { char *test_id, *subgroup_id, *verdict, *score, *outcome; };
+
+size_t podtest_encode_result_event(struct identity *id, char *submission, const struct result_fields *fields,
+        unsigned char event_id[16], uint64_t sequence, int64_t timestamp, unsigned char *out, size_t capacity) {
+    Podtest__Invoker__V1__Event event = PODTEST__INVOKER__V1__EVENT__INIT;
+    if (fields->outcome) {
+        event.kind = PODTEST__INVOKER__V1__EVENT__KIND__RUN_FINISHED;
+        event.outcome = fields->outcome;
+    } else {
+        event.score_presence_case = PODTEST__INVOKER__V1__EVENT__SCORE_PRESENCE_SCORE;
+        event.score = fields->score;
+        if (fields->test_id) {
+            event.kind = PODTEST__INVOKER__V1__EVENT__KIND__TEST_FINISHED;
+            event.test_id = fields->test_id;
+        } else if (fields->subgroup_id) {
+            event.kind = PODTEST__INVOKER__V1__EVENT__KIND__SUBGROUP_SCORE;
+            event.subgroup_id = fields->subgroup_id;
+        } else {
+            event.kind = PODTEST__INVOKER__V1__EVENT__KIND__PROBLEM_SCORE;
+        }
+    }
+    if (fields->verdict) event.verdict = fields->verdict;
+    return encode_event(event, id, submission, event_id, sequence, timestamp, out, capacity);
 }
 
 int podtest_matches_artifact_event(const unsigned char *wire, size_t len, const char *artifact) {

@@ -1,10 +1,19 @@
 //! The execution engine must use this entry point for a successful terminal
-//! event. The artifact-only daemon has no execution engine or Report sender.
+//! event. The artifact-only daemon does not produce execution results.
 const std = @import("std");
 const wal = @import("control/outbox.zig");
 const upload = @import("workspace/upload.zig");
 
 pub fn enqueueSuccess(outbox: *wal.Outbox, allocator: std.mem.Allocator, journal: *upload.Journal, run: upload.Pending, required_client_ids: []const []const u8, encoder: anytype) !u64 {
+    return enqueue(outbox, allocator, journal, run, required_client_ids, null, encoder);
+}
+
+/// Resume a terminal event at the ordinal reserved by a durable result plan.
+pub fn enqueueSuccessAt(outbox: *wal.Outbox, allocator: std.mem.Allocator, journal: *upload.Journal, run: upload.Pending, required_client_ids: []const []const u8, ordinal: u64, encoder: anytype) !u64 {
+    return enqueue(outbox, allocator, journal, run, required_client_ids, ordinal, encoder);
+}
+
+fn enqueue(outbox: *wal.Outbox, allocator: std.mem.Allocator, journal: *upload.Journal, run: upload.Pending, required_client_ids: []const []const u8, ordinal: ?u64, encoder: anytype) !u64 {
     const refs = try allocator.alloc([]u8, required_client_ids.len);
     var loaded: usize = 0;
     defer {
@@ -26,6 +35,7 @@ pub fn enqueueSuccess(outbox: *wal.Outbox, allocator: std.mem.Allocator, journal
             else => return err,
         };
         loaded += 1;
+        if (!try journal.reportRecorded(allocator, id)) return error.RequiredArtifactReportNotRecorded;
     }
     const Encoder = struct {
         refs: []const []u8,
@@ -34,7 +44,9 @@ pub fn enqueueSuccess(outbox: *wal.Outbox, allocator: std.mem.Allocator, journal
             return self.base.encode(run_id, sequence, event_id, self.refs);
         }
     };
-    return outbox.enqueue(allocator, run.run_id, Encoder{ .refs = refs, .base = encoder });
+    const gated: Encoder = .{ .refs = refs, .base = encoder };
+    if (ordinal) |sequence| return outbox.enqueueAt(allocator, run.run_id, sequence, gated);
+    return outbox.enqueue(allocator, run.run_id, gated);
 }
 
 test "missing receipt gates the WAL and does not consume the first sequence" {
@@ -74,7 +86,10 @@ test "missing receipt gates the WAL and does not consume the first sequence" {
     const spool_path = try std.fs.path.join(a, &.{ path, "spool" });
     defer a.free(spool_path);
     try journal.recover(a, spool_path, "log", .{ .origin = "https://example.invalid", .timeout_ms = 100, .byte_budget = 10 }, Fixture{});
+    try std.testing.expectError(error.RequiredArtifactReportNotRecorded, enqueueSuccess(&outbox, a, &journal, intent, &.{"log"}, Encoder{}));
+    try journal.markReportRecorded(a, "log");
     try std.testing.expectEqual(@as(u64, 1), try enqueueSuccess(&outbox, a, &journal, intent, &.{"log"}, Encoder{}));
+    try std.testing.expectEqual(@as(u64, 1), try enqueueSuccessAt(&outbox, a, &journal, intent, &.{"log"}, 1, Encoder{}));
     const records = try outbox.replay(a);
     defer wal.freeRecords(a, records);
     try std.testing.expectEqual(@as(usize, 1), records.len);

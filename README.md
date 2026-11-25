@@ -19,3 +19,5 @@ bash spikes/artifact-check.sh
 The binary is at `zig-out/bin/podtest-invoker`. `check CONFIG` performs one host preflight. `serve-diagnostics CONFIG` holds the instance lock until shutdown. The JSON fields and defaults are shown in [config.example.json](config.example.json). An empty `podman_socket` uses `$XDG_RUNTIME_DIR/podman/podman.sock`. Provision `state_dir` with mode `0700` before launch. The opt-in JetStream check requires the pinned Zig client dependency and a local `nats-server` executable on PATH. The artifact check requires Go, `openssl` and Python 3 and runs a local CA-signed HTTPS fixture.
 
 The verified compatibility matrix and implementation stages are in [docs/architecture.md](docs/architecture.md). The [control API notes](docs/control-api.md) describe the Go interoperability spike and the draft protocol changes. The deployment instructions are in [docs/deployment.md](docs/deployment.md).
+
+See [Phase 8 hardening](docs/phase8.md) for the container recovery runbook, live crash test, CPU calibration, and `install-diagnostics` staging target.

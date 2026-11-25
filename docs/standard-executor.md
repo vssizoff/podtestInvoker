@@ -32,24 +32,42 @@ strict JSON object with unknown and duplicate fields rejected:
 
 The only enabled feature set is:
 
-- Languages `posix_sh` and `javascript`, selected by operator-configured
-  immutable local image IDs. No image pull or language-defined recipe.
+- Languages `posix_sh`, `javascript`, `cpp23`, and `python314`, selected
+  by operator-configured immutable local image IDs. Imported Polygon
+  bundles declare a `languages` allowlist; the selected submission
+  language must be on that list. Single-language bundles use `language`.
 - Build `package_source`: the submitted `solution/source` is copied into
   a fixed recipe over the selected local base image. Only `FROM` and `COPY`
   are used; network is disabled and the image must have no `OnBuild` triggers.
+- C++ submissions compile once in a supervised container using
+  `/usr/local/bin/g++ -std=c++23 -O2` (`PODTEST_STANDARD_CPP23_IMAGE_ID`).
+  Only the resulting binary is copied into the run image. A failed
+  compilation yields `compilation_error` and zero points. Python uses
+  `/usr/local/bin/python3.14` in isolated mode (`PODTEST_STANDARD_PYTHON314_IMAGE_ID`).
 - Sequential independent tests, each with a fresh isolated container and
   the Phase 5 CPU, memory, PID, wall and bounded-stdio controls.
-- Checkers `exact_bytes` and ASCII-whitespace-delimited `ascii_tokens`.
+- Checkers `exact_bytes`, ASCII-whitespace-delimited `ascii_tokens`, and
+  `testlib`. A `testlib` task supplies `checker/checker.cpp` and
+  `checker/testlib.h` (1 MiB each). Set `PODTEST_TESTLIB_IMAGE_ID` to a
+  trusted local GCC image with `/usr/local/bin/g++`. The compiler runs in
+  a supervised container; only the compiled executable is copied into the
+  checker image. The checker runs separately from the submission and
+  gets the input, contestant output, and jury answer. Input and answer
+  files may each be up to 32 MiB, subject to a 64 MiB combined budget
+  across the task. `testset` defaults to `tests`.
 - Group scoring `sum` or `all_or_nothing`; points are integer milli-points.
-- Result JSON is published atomically only after every test finishes and
-  image cleanup succeeds. A partial run has no `result.json`.
+- Testlib `_points` is a fraction from 0 to 1; `_pc` is an integer
+  percentage. `sum` includes earned partial points, whereas
+  `all_or_nothing` requires every test to be accepted. Checker failures and
+  invalid reports are testing errors rather than contestant verdicts.
+- Result JSON is published atomically after tests and image cleanup, or as
+  a terminal infrastructure error. An interrupted run has no `result.json`.
 
 Unknown fields/features, unsafe paths, duplicate identifiers, missing
 groups, unconfigured language images, non-rootless Podman and images with
 build triggers are rejected. Validators, custom languages/templates,
-arbitrary Containerfiles/commands, Polygon testlib checkers, interactors,
-subtasks/dependencies, nontrivial Polygon scoring, and backend event/artifact
-reporting are not implemented. The producer must normalize into this
+arbitrary Containerfiles/commands, interactors, subtasks/dependencies, and
+nontrivial Polygon scoring are not implemented. The producer must normalize into this
 explicit v1 subset or reject the task; it must not silently downgrade.
 
 Live acceptance requires local Alpine and Node images, rootless Podman, and

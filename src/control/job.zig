@@ -14,6 +14,7 @@ pub const Job = struct {
     contest_problem_id: []const u8,
     execution_format: enum { standard, scripted_lua },
     execution_format_version: u32,
+    language: ?[]const u8 = null,
     created_at: []const u8,
 };
 

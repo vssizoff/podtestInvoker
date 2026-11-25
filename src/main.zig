@@ -1,6 +1,11 @@
 const std = @import("std");
+
+test {
+    if (@import("build_options").artifact_control) _ = @import("standard/report.zig");
+}
 const core = @import("core.zig");
 const linux = std.os.linux;
+const janitor = @import("janitor");
 
 extern fn podtest_lock(path: [*:0]const u8) c_int;
 extern fn podtest_ping(path: [*:0]const u8, version: [*:0]const u8) c_int;
@@ -25,8 +30,12 @@ fn run(init: std.process.Init) !void {
     const prepare = std.mem.eql(u8, args[1], "prepare-assigned");
     const stage = std.mem.eql(u8, args[1], "stage-artifact");
     const fixture = std.mem.eql(u8, args[1], "test-claim-delivery");
-    if (!check and !serve and !artifacts and !prepare and !stage and !fixture) return error.InvalidArguments;
-    if (args.len != @as(usize, if (fixture) 7 else if (stage) 7 else if (prepare) 4 else 3)) return error.InvalidArguments;
+    const standard_once = std.mem.eql(u8, args[1], "work-standard-once");
+    const standard = standard_once or std.mem.eql(u8, args[1], "serve-standard");
+    const sweep = std.mem.eql(u8, args[1], "sweep-resources") or std.mem.eql(u8, args[1], "sweep-containers");
+    const calibrate = std.mem.eql(u8, args[1], "calibrate-cpu");
+    if (!check and !serve and !artifacts and !prepare and !stage and !fixture and !standard and !sweep and !calibrate) return error.InvalidArguments;
+    if (args.len != @as(usize, if (fixture or stage) 7 else if (prepare or calibrate) 4 else 3)) return error.InvalidArguments;
 
     const config = try loadConfig(init, args[2]);
     const a = init.arena.allocator();
@@ -34,6 +43,12 @@ fn run(init: std.process.Init) !void {
     if (fd == -2) return error.InstanceAlreadyRunning;
     if (fd < 0) return error.UnsafeOrUnavailableStateDirectory;
     defer _ = linux.close(fd);
+
+    if (calibrate) {
+        if (@import("builtin").mode != .safe) return error.CalibrationRequiresReleaseSafe;
+        const reference = std.fmt.parseInt(u64, args[3], 10) catch return error.InvalidCalibrationReference;
+        return log(init.io, try @import("calibration.zig").measure(init.io, reference));
+    }
 
     if (fixture) {
         if (comptime !@import("build_options").claim_fixture) return error.ClaimFixtureNotBuilt;
@@ -45,7 +60,7 @@ fn run(init: std.process.Init) !void {
         return runArtifacts(init, config, args[3..]);
     }
 
-    const signal_fd = if (serve) try shutdownFd() else -1;
+    const signal_fd = if (serve or standard) try shutdownFd() else -1;
     defer if (signal_fd >= 0) {
         _ = linux.close(signal_fd);
     };
@@ -61,6 +76,17 @@ fn run(init: std.process.Init) !void {
     var random: [16]u8 = undefined;
     try std.Io.randomSecure(init.io, &random);
     const identity = core.ProcessIdentity.init(config.invoker_id, random);
+    const journal: janitor.Journal = .{ .io = init.io, .state = .{ .handle = fd }, .invoker_id = identity.invoker_id, .epoch = &identity.process_epoch };
+    const client: @import("podman").Client = .{ .socket = try a.dupeSentinel(u8, config.podman_socket, 0), .api_version = try a.dupeSentinel(u8, config.libpod_api_version, 0) };
+    if (standard) {
+        if (comptime !@import("build_options").standard_worker) return error.StandardWorkerNotBuilt;
+        try sweepContainers(init, journal, client, true, signal_fd);
+        return @import("standard_worker.zig").run(init, config, journal, client, signal_fd, standard_once);
+    }
+    if (sweep or serve) {
+        try sweepContainers(init, journal, client, sweep, if (serve) signal_fd else null);
+        if (sweep) return;
+    }
     try log(init.io, .{
         .subsystem = "process",
         .operation = if (serve) "diagnostics_started" else "host_check_passed",
@@ -76,6 +102,17 @@ fn run(init: std.process.Init) !void {
     if (serve) {
         var info: linux.signalfd_siginfo = undefined;
         while (true) {
+            var poll = [_]linux.pollfd{.{ .fd = signal_fd, .events = linux.POLL.IN, .revents = 0 }};
+            const ready = linux.poll(&poll, poll.len, 30_000);
+            switch (linux.errno(ready)) {
+                .SUCCESS => {},
+                .INTR => continue,
+                else => return error.ShutdownSignalReadFailed,
+            }
+            if (ready == 0) {
+                sweepContainers(init, journal, client, false, signal_fd) catch |err| try log(init.io, .{ .operation = "container_sweep_failed", .error_code = @errorName(err) });
+                continue;
+            }
             const result = linux.read(signal_fd, std.mem.asBytes(&info).ptr, @sizeOf(linux.signalfd_siginfo));
             if (linux.errno(result) == .INTR) continue;
             if (result != @sizeOf(linux.signalfd_siginfo)) return error.ShutdownSignalReadFailed;
@@ -83,6 +120,14 @@ fn run(init: std.process.Init) !void {
         }
         try log(init.io, .{ .subsystem = "process", .operation = "shutdown", .invoker_id = identity.invoker_id, .process_epoch = identity.process_epoch[0..] });
     }
+}
+
+fn sweepContainers(init: std.process.Init, journal: janitor.Journal, client: @import("podman").Client, explicit: bool, stop_fd: ?c_int) !void {
+    const result = try journal.sweep(init.gpa, client, stop_fd);
+    if (explicit or result.removed != 0 or result.rejected != 0 or result.unresolved != 0) {
+        try log(init.io, .{ .operation = "container_sweep", .invoker_id = journal.invoker_id, .removed = result.removed, .rejected = result.rejected, .unresolved = result.unresolved, .execution_ready = false });
+    }
+    if (explicit and (result.rejected != 0 or result.unresolved != 0)) return error.ContainerRecoveryPending;
 }
 
 fn runArtifacts(init: std.process.Init, config: core.Config, args: []const [:0]const u8) !void {

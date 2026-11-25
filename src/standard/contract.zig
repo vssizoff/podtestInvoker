@@ -6,15 +6,19 @@ pub const max_file = 1 << 20;
 pub const max_tests = 64;
 pub const max_payload = 16 << 20;
 pub const max_history = 2 << 20;
-pub const Language = enum { posix_sh, javascript };
-pub const Checker = enum { exact_bytes, ascii_tokens };
+pub const Language = enum { posix_sh, javascript, cpp23, python314 };
+pub const Checker = enum { exact_bytes, ascii_tokens, testlib };
+pub const testlib_file = 32 << 20;
+pub const testlib_payload = 64 << 20;
 pub const Group = struct { id: []const u8, scoring: enum { sum, all_or_nothing } };
 pub const Case = struct { id: []const u8, group: []const u8, input: []const u8, answer: []const u8, points_milli: u32 };
 pub const Task = struct {
     version: u32,
     language: Language,
+    languages: []const Language = &.{},
     build: enum { package_source },
     checker: Checker,
+    testset: []const u8 = "tests",
     limits: resource.Request,
     groups: []const Group,
     tests: []const Case,
@@ -26,8 +30,14 @@ pub fn parse(a: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(Task) {
     errdefer parsed.deinit();
     if (parsed.value.version != 1) return error.UnsupportedStandardVersion;
     const task = parsed.value;
+    if (task.languages.len != 0) {
+        if (task.languages.len > @typeInfo(Language).@"enum".field_names.len or std.mem.indexOfScalar(Language, task.languages, task.language) == null) return error.InvalidStandardTask;
+        for (task.languages, 0..) |lang, i| {
+            if (std.mem.indexOfScalar(Language, task.languages[0..i], lang) != null) return error.InvalidStandardTask;
+        }
+    }
     _ = try resource.Policy.resolve(task.limits, .{});
-    if (task.limits.output_bytes > max_history or task.tests.len == 0 or task.tests.len > max_tests or
+    if (!identifier(task.testset) or task.limits.output_bytes > @as(u64, if (task.checker == .testlib) testlib_file else max_history) or task.tests.len == 0 or task.tests.len > max_tests or
         task.groups.len == 0 or task.groups.len > task.tests.len) return error.InvalidStandardTask;
     var used: [max_tests]bool = @splat(false);
     for (task.groups, 0..) |g, i| {
@@ -41,6 +51,14 @@ pub fn parse(a: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(Task) {
     }
     for (used[0..task.groups.len]) |has_tests| if (!has_tests) return error.EmptyStandardGroup;
     return parsed;
+}
+
+pub fn selectLanguage(task: Task, requested: ?[]const u8) !Language {
+    if (task.languages.len != 0 and requested == null) return error.MissingStandardLanguage;
+    const code = requested orelse return task.language;
+    const language = std.meta.stringToEnum(Language, code) orelse return error.UnsupportedStandardLanguage;
+    if (if (task.languages.len == 0) language != task.language else std.mem.indexOfScalar(Language, task.languages, language) == null) return error.UnsupportedStandardLanguage;
+    return language;
 }
 
 pub fn groupIndex(groups: []const Group, id: []const u8) !usize {
@@ -68,6 +86,7 @@ fn testPath(path: []const u8) bool {
 
 pub fn matches(checker: Checker, actual: []const u8, expected: []const u8) bool {
     if (checker == .exact_bytes) return std.mem.eql(u8, actual, expected);
+    if (checker != .ascii_tokens) return false;
     var left = std.mem.tokenizeAny(u8, actual, " \t\n\r\x0b\x0c");
     var right = std.mem.tokenizeAny(u8, expected, " \t\n\r\x0b\x0c");
     while (left.next()) |value| {
@@ -83,8 +102,13 @@ pub const GroupScore = struct {
     all_passed: bool = true,
 
     pub fn record(self: *GroupScore, points: u32, passed: bool) void {
+        self.recordPoints(points, if (passed) points else 0, passed);
+    }
+
+    pub fn recordPoints(self: *GroupScore, points: u32, earned: u32, passed: bool) void {
         self.maximum += points;
-        if (passed) self.earned += points else self.all_passed = false;
+        self.earned += earned;
+        if (!passed) self.all_passed = false;
     }
 
     pub fn value(self: GroupScore, mode: Group) u64 {
@@ -110,6 +134,14 @@ test "all-or-nothing fails even when a zero-point test fails" {
     score.record(1001, true);
     score.record(0, false);
     try std.testing.expectEqual(@as(u64, 1001), score.value(.{ .id = "g", .scoring = .sum }));
+    try std.testing.expectEqual(@as(u64, 0), score.value(.{ .id = "g", .scoring = .all_or_nothing }));
+}
+
+test "partial credit contributes only to sum groups" {
+    var score: GroupScore = .{};
+    score.record(1000, true);
+    score.recordPoints(1000, 250, false);
+    try std.testing.expectEqual(@as(u64, 1250), score.value(.{ .id = "g", .scoring = .sum }));
     try std.testing.expectEqual(@as(u64, 0), score.value(.{ .id = "g", .scoring = .all_or_nothing }));
 }
 

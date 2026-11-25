@@ -89,8 +89,7 @@ pub const Client = struct {
     };
 
     pub fn inspectTag(self: Client, a: std.mem.Allocator, tag: []const u8, out: []u8) !Id {
-        var buf: [160]u8 = undefined;
-        const bytes = try self.request("GET", try tagPath(&buf, tag, "/json"), null, out, 5000);
+        const bytes = try self.inspectTagMetadata(tag, out);
         const parsed = try std.json.parseFromSlice(struct { Id: []const u8 }, a, bytes, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
         const raw = if (std.mem.startsWith(u8, parsed.value.Id, "sha256:")) parsed.value.Id[7..] else parsed.value.Id;
@@ -98,6 +97,11 @@ pub const Client = struct {
         const id = raw[0..64].*;
         try validateId(id);
         return id;
+    }
+
+    pub fn inspectTagMetadata(self: Client, tag: []const u8, out: []u8) ![]u8 {
+        var buf: [160]u8 = undefined;
+        return self.request("GET", try tagPath(&buf, tag, "/json"), null, out, 5000);
     }
 
     pub fn removeTag(self: Client, tag: []const u8, out: []u8) !void {
@@ -149,10 +153,12 @@ pub const Client = struct {
             .cap_drop = &[_][]const u8{"ALL"},
             .read_only_filesystem = true,
             .read_write_tmpfs = false,
+            .mounts = if (spec.scratch) &scratch_mount else &no_mounts,
             .image_volume_mode = "ignore",
             .http_proxy = false,
             .stdin = spec.stdin,
             .terminal = false,
+            .labels = spec.labels,
             .log_configuration = .{ .driver = if (spec.live_io) "none" else "k8s-file", .size = @as(i64, 1 << 20) },
             .resource_limits = .{
                 .memory = .{ .limit = policy.memory_bytes, .swap = policy.memory_bytes + policy.swap_bytes },
@@ -172,13 +178,17 @@ pub const Client = struct {
     }
 
     pub fn createNetwork(self: Client, a: std.mem.Allocator, name: []const u8, run_id: []const u8, out: []u8) !Id {
+        return self.createNetworkWithLabels(a, name, run_id, null, out);
+    }
+
+    pub fn createNetworkWithLabels(self: Client, a: std.mem.Allocator, name: []const u8, run_id: []const u8, labels: ?ContainerLabels, out: []u8) !Id {
         if (!validName(name) or !validName(run_id)) return error.PodmanInvalidRequest;
         const body = try std.json.Stringify.valueAlloc(a, .{
             .name = name,
             .driver = "bridge",
             .internal = true,
             .dns_enabled = false,
-            .labels = .{ .@"managed-by" = "podtest-invoker", .@"podtest.run_id" = run_id },
+            .labels = labels orelse ContainerLabels{ .@"podtest.invoker_id" = "", .@"podtest.process_epoch" = "", .@"podtest.run_id" = run_id, .@"podtest.resource_kind" = "network", .@"podtest.journal_id" = "" },
         }, .{});
         defer a.free(body);
         const bytes = try self.request("POST", "/networks/create", body, out, 30000);
@@ -202,6 +212,13 @@ pub const Client = struct {
         try validateId(id);
         var path: [128]u8 = undefined;
         const endpoint = try std.fmt.bufPrintSentinel(&path, "/networks/{s}/json", .{&id}, 0);
+        return self.request("GET", endpoint, null, out, 5000);
+    }
+
+    pub fn inspectNetworkName(self: Client, name: []const u8, out: []u8) ![]u8 {
+        if (!validName(name)) return error.PodmanInvalidRequest;
+        var path: [128]u8 = undefined;
+        const endpoint = try std.fmt.bufPrintSentinel(&path, "/networks/{s}/json", .{name}, 0);
         return self.request("GET", endpoint, null, out, 5000);
     }
 
@@ -314,7 +331,19 @@ pub const Client = struct {
 };
 
 pub const Id = [64]u8;
-pub const ContainerSpec = struct { name: []const u8, image: Id, command: []const []const u8, stdin: bool = false, live_io: bool = false };
+pub const ContainerLabels = struct {
+    @"managed-by": []const u8 = "podtest-invoker",
+    @"podtest.invoker_id": []const u8,
+    @"podtest.process_epoch": []const u8,
+    @"podtest.run_id": []const u8,
+    @"podtest.resource_kind": []const u8 = "container",
+    @"podtest.journal_id": []const u8,
+};
+
+const Mount = struct { type: []const u8, destination: []const u8, options: []const []const u8 };
+const scratch_mount = [_]Mount{.{ .type = "tmpfs", .destination = "/tmp", .options = &.{ "size=96m", "mode=1777", "noexec", "nosuid", "nodev" } }};
+const no_mounts = [_]Mount{};
+pub const ContainerSpec = struct { name: []const u8, image: Id, command: []const []const u8, stdin: bool = false, live_io: bool = false, labels: ?ContainerLabels = null, scratch: bool = false };
 
 pub fn validateSpec(spec: ContainerSpec) !void {
     if (!validName(spec.name) or spec.command.len == 0) return error.PodmanInvalidRequest;
@@ -433,7 +462,7 @@ fn validName(name: []const u8) bool {
 }
 
 fn validTag(tag: []const u8) bool {
-    if (!validName(tag) or !(std.mem.startsWith(u8, tag, "podtest-phase4-") or std.mem.startsWith(u8, tag, "podtest-phase7-"))) return false;
+    if (!validName(tag) or !(std.mem.startsWith(u8, tag, "podtest-phase4-") or std.mem.startsWith(u8, tag, "podtest-phase7-") or std.mem.startsWith(u8, tag, "podtest-owned-"))) return false;
     return blk: {
         for (tag) |c| if (std.ascii.isUpper(c)) break :blk false;
         break :blk true;
@@ -441,7 +470,7 @@ fn validTag(tag: []const u8) bool {
 }
 
 fn tagVersion(tag: []const u8) []const u8 {
-    return if (std.mem.startsWith(u8, tag, "podtest-phase7-")) "phase7" else "phase4";
+    return if (std.mem.startsWith(u8, tag, "podtest-owned-")) "temporary" else if (std.mem.startsWith(u8, tag, "podtest-phase7-")) "phase7" else "phase4";
 }
 
 fn tagPath(buf: []u8, tag: []const u8, suffix: []const u8) ![:0]const u8 {

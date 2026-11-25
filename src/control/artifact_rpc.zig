@@ -50,6 +50,7 @@ extern fn podtest_control_heartbeat(*anyopaque, [*:0]const u8, u32, u32, u32, [*
 extern fn podtest_control_create(*anyopaque, *Identity, [*:0]const u8, [*:0]const u8, u64, *const [32]u8, *Grant) c_int;
 extern fn podtest_control_complete(*anyopaque, *Identity, [*:0]const u8) c_int;
 extern fn podtest_encode_artifact_event(*Identity, [*:0]const u8, [*:0]const u8, *const [16]u8, u64, i64, [*]u8, usize) usize;
+extern fn podtest_encode_result_event(*Identity, [*:0]const u8, *const ResultFields, *const [16]u8, u64, i64, [*]u8, usize) usize;
 extern fn podtest_matches_artifact_event([*]const u8, usize, [*:0]const u8) c_int;
 extern fn podtest_control_report(*anyopaque, [*]const u8, usize) c_int;
 extern fn podtest_control_renew(*anyopaque, *Identity, *Renewed) c_int;
@@ -75,6 +76,95 @@ pub const ArtifactEvent = struct {
         return self.buffer[0..len];
     }
 };
+
+const ResultFields = extern struct {
+    test_id: ?[*:0]const u8 = null,
+    subgroup_id: ?[*:0]const u8 = null,
+    verdict: ?[*:0]const u8 = null,
+    score: ?[*:0]const u8 = null,
+    outcome: ?[*:0]const u8 = null,
+};
+
+pub const ResultEvent = struct {
+    identity: Identity,
+    submission: [:0]const u8,
+    timestamp_ms: i64,
+    result: Result,
+    buffer: [1024]u8 = undefined,
+
+    pub const Result = union(enum) {
+        test_finished: struct { id: [:0]const u8, verdict: [:0]const u8, score_milli: u64 },
+        subgroup_score: struct { id: [:0]const u8, score_milli: u64 },
+        problem_score: u64,
+        success: [:0]const u8,
+        infrastructure_error,
+        timeout,
+    };
+
+    pub fn encode(self: *ResultEvent, run_id: []const u8, sequence: u64, event_id: [16]u8) ![]const u8 {
+        if (!std.mem.eql(u8, run_id, std.mem.span(self.identity.run))) return error.ResultRunMismatch;
+        var score: [32]u8 = undefined;
+        const fields: ResultFields = switch (self.result) {
+            .test_finished => |test_result| .{ .test_id = test_result.id, .verdict = test_result.verdict, .score = try decimal(&score, test_result.score_milli) },
+            .subgroup_score => |group| .{ .subgroup_id = group.id, .score = try decimal(&score, group.score_milli) },
+            .problem_score => |points| .{ .score = try decimal(&score, points) },
+            .success => |verdict| .{ .outcome = "success", .verdict = verdict },
+            .infrastructure_error => .{ .outcome = "infrastructure_error" },
+            .timeout => .{ .outcome = "timeout" },
+        };
+        const len = podtest_encode_result_event(&self.identity, self.submission, &fields, &event_id, sequence, self.timestamp_ms, &self.buffer, self.buffer.len);
+        if (len == 0) return error.EventTooLarge;
+        return self.buffer[0..len];
+    }
+
+    pub fn successEncoder(self: *ResultEvent) !SuccessEncoder {
+        if (self.result != .success) return error.ExpectedSuccessfulResult;
+        return .{ .event = self };
+    }
+
+    pub const SuccessEncoder = struct {
+        event: *ResultEvent,
+
+        pub fn encode(self: SuccessEncoder, run_id: []const u8, sequence: u64, event_id: [16]u8, _: []const []u8) ![]const u8 {
+            if (self.event.result != .success) return error.ExpectedSuccessfulResult;
+            return self.event.encode(run_id, sequence, event_id);
+        }
+    };
+
+    fn decimal(buffer: []u8, score_milli: u64) ![:0]const u8 {
+        return std.fmt.bufPrintSentinel(buffer, "{d}.{d:0>3}", .{ score_milli / 1000, score_milli % 1000 }, 0);
+    }
+};
+
+test "result event encodes exact decimal score and distinct protobuf kinds" {
+    var event: ResultEvent = .{
+        .identity = .{ .invoker = "invoker", .epoch = "epoch", .attempt = "attempt", .run = "run", .token = @splat(1) },
+        .submission = "submission",
+        .timestamp_ms = 1,
+        .result = .{ .test_finished = .{ .id = "test-1", .verdict = "accepted", .score_milli = 500 } },
+    };
+    const event_id: [16]u8 = @splat(1);
+    try std.testing.expectError(error.ExpectedSuccessfulResult, event.successEncoder());
+    try std.testing.expectError(error.ResultRunMismatch, event.encode("other", 1, event_id));
+    const suffixes = [_]struct { ResultEvent.Result, []const u8 }{
+        .{ event.result, "\x48\x06\x52\x08accepted\x5a\x05" ++ "0.500\x62\x06test-1" },
+        .{ .{ .subgroup_score = .{ .id = "group-1", .score_milli = 5 } }, "\x48\x07\x5a\x05" ++ "0.005\x6a\x07group-1" },
+        .{ .{ .problem_score = 1001 }, "\x48\x08\x5a\x05" ++ "1.001" },
+        .{ .{ .success = "accepted" }, "\x48\x0d\x52\x08accepted" },
+    };
+    for (suffixes) |sample| {
+        event.result = sample[0];
+        const wire = try event.encode("run", 1, event_id);
+        const kind_offset = std.mem.indexOf(u8, wire, "\x40\x01\x48").? + 2;
+        try std.testing.expectEqualSlices(u8, sample[1], wire[kind_offset..][0..sample[1].len]);
+        if (event.result == .success) {
+            const encoder = try event.successEncoder();
+            var artifact = "artifact".*;
+            const terminal = try encoder.encode("run", 1, event_id, &.{&artifact});
+            try std.testing.expect(std.mem.endsWith(u8, terminal, "\x82\x01\x07success"));
+        }
+    }
+}
 
 pub const Channel = struct {
     handle: *anyopaque,

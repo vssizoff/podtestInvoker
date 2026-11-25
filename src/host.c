@@ -2,11 +2,27 @@
 #include <curl/curl.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/magic.h>
 #include <string.h>
 #include <strings.h>
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
+#include <sys/vfs.h>
 #include <unistd.h>
+
+int podtest_has_disk_space(int fd) {
+    struct statvfs stat;
+    if (fstatvfs(fd, &stat) != 0 || stat.f_frsize == 0 ||
+        stat.f_bavail < (2ULL * 1024 * 1024 * 1024 + stat.f_frsize - 1) / stat.f_frsize)
+        return 0;
+    if (stat.f_favail >= 16384) return 1;
+
+    /* Btrfs allocates inodes dynamically and reports no inode counts. */
+    struct statfs fs;
+    return stat.f_files == 0 && stat.f_favail == 0 &&
+        fstatfs(fd, &fs) == 0 && fs.f_type == BTRFS_SUPER_MAGIC;
+}
 
 /* State directory is provisioned by the operator. Lock the directory inode. */
 int podtest_lock(const char *path) {

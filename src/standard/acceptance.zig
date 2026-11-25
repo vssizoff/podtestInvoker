@@ -3,6 +3,7 @@ const extract = @import("extract");
 const executor = @import("executor.zig");
 const podman = @import("engine").podman;
 const Sha256 = std.crypto.hash.sha2.Sha256;
+extern "c" fn flock(c_int, c_int) c_int;
 
 pub fn main(init: std.process.Init) !void {
     const a = init.arena.allocator();
@@ -20,16 +21,28 @@ pub fn main(init: std.process.Init) !void {
     defer cwd.deleteTree(io, name) catch |err| std.log.err("fixture cleanup failed: {s}", .{@errorName(err)});
     const parent = try cwd.openDir(io, name, .{});
     defer parent.close(io);
+    try parent.createDir(io, "state", .fromMode(0o700));
+    const state = try parent.openDir(io, "state", .{ .iterate = true });
+    defer state.close(io);
+    if (flock(state.handle, 2 | 4) != 0) return error.CannotLockFixtureState;
 
     const images: executor.Images = .{ .posix_sh = sh[0..64].*, .javascript = js[0..64].* };
-    try check(init, client, parent, images, false);
-    try check(init, client, parent, images, true);
+    try check(init, client, parent, state, images, false);
+    try check(init, client, parent, state, images, true);
+    const journal_dir = try state.openDir(io, @import("engine").janitor.directory, .{ .iterate = true });
+    defer journal_dir.close(io);
+    var entries = journal_dir.iterate();
+    if (try entries.next(io) != null) return error.StandardLeftContainerIntent;
     std.log.info("Standard v1 USTAR and rootless judging acceptance passed for shell and JavaScript", .{});
 }
 
-fn check(init: std.process.Init, client: podman.Client, parent: std.Io.Dir, images: executor.Images, js: bool) !void {
+fn check(init: std.process.Init, client: podman.Client, parent: std.Io.Dir, state: std.Io.Dir, images: executor.Images, js: bool) !void {
     const a = init.arena.allocator();
     const io = init.io;
+    const ownership: @import("engine").group.Ownership = .{
+        .journal = .{ .io = io, .state = state, .invoker_id = "standard-fixture", .epoch = "00000000-0000-4000-8000-000000000001" },
+        .run_id = if (js) "standard-js" else "standard-sh",
+    };
     const inputs_name = if (js) "js-inputs" else "sh-inputs";
     const outputs_name = if (js) "js-outputs" else "sh-outputs";
     const source = if (js) "process.stdout.write(require('node:fs').readFileSync(0));" else "IFS= read -r mode; case $mode in timeout) exec sleep 30;; output) exec yes;; error) exit 42;; esac; exec cat";
@@ -73,7 +86,7 @@ fn check(init: std.process.Init, client: podman.Client, parent: std.Io.Dir, imag
     try parent.createDir(io, outputs_name, .fromMode(0o700));
     const outputs = try parent.openDir(io, outputs_name, .{});
     defer outputs.close(io);
-    try executor.run(a, io, client, inputs, outputs, images, null);
+    try executor.run(a, io, client, inputs, outputs, images, null, ownership);
     const result = try outputs.readFileAlloc(io, "result.json", a, .limited(64 << 10));
     const parsed = try std.json.parseFromSliceLeaky(struct { version: u32, tests: []executor.TestResult, groups: []executor.GroupResult, problem_score_milli: u64 }, a, result, .{});
     const expected: []const executor.Verdict = if (js) &.{ .accepted, .wrong_answer, .accepted } else &.{ .accepted, .wrong_answer, .accepted, .wall_timeout, .output_limit, .runtime_error };
@@ -93,7 +106,7 @@ fn check(init: std.process.Init, client: podman.Client, parent: std.Io.Dir, imag
         executor.run(a, io, client, inputs, cancelled_outputs, images, .{
             .check = CancelBeforeSecondTest.check,
             .context = &cancellation,
-        }) catch |err| switch (err) {
+        }, ownership) catch |err| switch (err) {
             error.GroupCancelled => {
                 cancelled_outputs.access(io, "result.json", .{}) catch |access_err| {
                     if (access_err == error.FileNotFound) return;

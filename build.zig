@@ -6,8 +6,12 @@ pub fn build(b: *std.Build) void {
         @panic("podtest-invoker requires Linux x86-64");
     const optimize = b.standardOptimizeOption(.{});
     const resource = b.createModule(.{ .root_source_file = b.path("src/resource.zig"), .target = target, .optimize = optimize });
+    const podman = b.createModule(.{ .root_source_file = b.path("src/podman/client.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "resource", .module = resource }} });
+    const janitor = b.createModule(.{ .root_source_file = b.path("src/janitor.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "podman", .module = podman }} });
     const engine = b.createModule(.{ .root_source_file = b.path("src/podman/engine.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "resource", .module = resource }, .{ .name = "history", .module = b.createModule(.{ .root_source_file = b.path("src/stdio_history.zig"), .target = target, .optimize = optimize }) }, .{ .name = "pipe", .module = b.createModule(.{ .root_source_file = b.path("src/pipe.zig"), .target = target, .optimize = optimize }) } } });
     const standard_tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("src/standard/contract.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "resource", .module = resource }} }) });
+    engine.addImport("podman", podman);
+    engine.addImport("janitor", janitor);
     if (b.option(bool, "lua-runner", "Build the standalone Phase 6 Lua runner") orelse false) {
         const runner = b.addExecutable(.{ .name = "podtest-lua-runner", .root_module = b.createModule(.{
             .target = target,
@@ -51,20 +55,28 @@ pub fn build(b: *std.Build) void {
     exe.root_module.link_libc = true;
     exe.root_module.addCSourceFile(.{ .file = b.path("src/host.c"), .flags = &.{ "-Wall", "-Wextra", "-Werror" } });
     exe.root_module.addCSourceFile(.{ .file = b.path("src/podman/client.c"), .flags = &.{ "-Wall", "-Wextra", "-Werror" } });
-    exe.root_module.addImport("podman", b.createModule(.{ .root_source_file = b.path("src/podman/client.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "resource", .module = resource }} }));
+    exe.root_module.addImport("podman", podman);
+    exe.root_module.addImport("janitor", janitor);
     exe.root_module.linkSystemLibrary("libcurl", .{});
     const grpc_enabled = b.option(bool, "artifact-control", "Build the mTLS artifact-control client") orelse false;
     const options = b.addOptions();
     options.addOption(bool, "artifact_control", grpc_enabled);
     const claim_fixture = b.option(bool, "claim-fixture", "Build the loopback JetStream Claim acceptance command") orelse false;
     options.addOption(bool, "claim_fixture", claim_fixture);
-    if (claim_fixture) {
-        if (!grpc_enabled) @panic("claim-fixture requires artifact-control");
+    const standard_worker = b.option(bool, "standard-worker", "Build the opt-in Standard queue worker") orelse false;
+    options.addOption(bool, "standard_worker", standard_worker);
+    if (claim_fixture or standard_worker) {
+        if (!grpc_enabled) @panic("JetStream commands require artifact-control");
         const nats = b.lazyDependency("nats", .{ .target = target, .optimize = optimize }) orelse return;
         exe.root_module.addImport("nats", nats.module("nats"));
     }
+    if (standard_worker) {
+        exe.root_module.addImport("engine", engine);
+        exe.root_module.addImport("history", engine.import_table.get("history").?);
+    }
     exe.root_module.addOptions("build_options", options);
     if (grpc_enabled) {
+        exe.root_module.addImport("resource", resource);
         const gen = b.addSystemCommand(&.{ "bash", "spikes/gen-control-c.sh" });
         gen.addFileInput(b.path("spikes/gen-control-c.sh"));
         gen.addFileArg(b.path("proto/control.proto"));
@@ -80,6 +92,51 @@ pub fn build(b: *std.Build) void {
         for ([_][]const u8{ "grpc", "gpr", "protobuf-c" }) |lib| exe.root_module.linkSystemLibrary(lib, .{ .use_pkg_config = .no });
     }
     b.installArtifact(exe);
+    const release = b.step("install-diagnostics", "Stage the diagnostics binary, sample config, unit and runbooks");
+    release.dependOn(&b.addInstallArtifact(exe, .{}).step);
+    release.dependOn(&b.addInstallFile(b.path("config.example.json"), "share/podtest-invoker/config.example.json").step);
+    release.dependOn(&b.addInstallFile(b.path("deploy/podtest-invoker.service"), "share/podtest-invoker/podtest-invoker.service").step);
+    for ([_][]const u8{ "deployment.md", "phase8.md" }) |name| {
+        release.dependOn(&b.addInstallFile(b.path(b.pathJoin(&.{ "docs", name })), b.pathJoin(&.{ "share/podtest-invoker/docs", name })).step);
+    }
+
+    const janitor_fixture = b.addExecutable(.{ .name = "test-janitor-fixture", .root_module = b.createModule(.{
+        .root_source_file = b.path("src/janitor_fixture.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    }) });
+    janitor_fixture.root_module.addImport("podman", podman);
+    janitor_fixture.root_module.addImport("janitor", janitor);
+    janitor_fixture.root_module.linkSystemLibrary("libcurl", .{});
+    janitor_fixture.root_module.addCSourceFile(.{ .file = b.path("src/host.c"), .flags = &.{ "-Wall", "-Wextra", "-Werror" } });
+    janitor_fixture.root_module.addCSourceFile(.{ .file = b.path("src/podman/client.c"), .flags = &.{ "-Wall", "-Wextra", "-Werror" } });
+    const janitor_live = b.addSystemCommand(&.{"bash"});
+    janitor_live.addFileArg(b.path("spikes/janitor-check.sh"));
+    janitor_live.addArtifactArg(exe);
+    janitor_live.addArtifactArg(janitor_fixture);
+    janitor_live.addFileArg(b.path("config.example.json"));
+    b.step("test-janitor", "Verify locked container crash recovery on rootless Libpod").dependOn(&janitor_live.step);
+    const janitor_load = b.addSystemCommand(&.{"bash"});
+    janitor_load.addFileArg(b.path("spikes/janitor-load.sh"));
+    janitor_load.addFileArg(b.path("spikes/janitor-check.sh"));
+    janitor_load.addArtifactArg(exe);
+    janitor_load.addArtifactArg(janitor_fixture);
+    janitor_load.addFileArg(b.path("config.example.json"));
+    b.step("test-janitor-load", "Run eight bounded two-owner recovery rounds on rootless Libpod").dependOn(&janitor_load.step);
+
+    const crash_fixture = b.addExecutable(.{ .name = "test-outbox-crash-fixture", .root_module = b.createModule(.{
+        .root_source_file = b.path("src/control/outbox_crash.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    }) });
+    crash_fixture.root_module.linkSystemLibrary("libcurl", .{});
+    crash_fixture.root_module.addCSourceFile(.{ .file = b.path("src/host.c"), .flags = &.{ "-Wall", "-Wextra", "-Werror" } });
+    const crash_check = b.addSystemCommand(&.{"bash"});
+    crash_check.addFileArg(b.path("spikes/outbox-crash-check.sh"));
+    crash_check.addArtifactArg(crash_fixture);
+    b.step("test-outbox-crash", "Verify WAL replay after process SIGKILL before ACK").dependOn(&crash_check.step);
 
     const tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -90,8 +147,12 @@ pub fn build(b: *std.Build) void {
     });
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");
+    if (grpc_enabled) test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = exe.root_module })).step);
     test_step.dependOn(&run_tests.step);
     test_step.dependOn(&b.addRunArtifact(standard_tests).step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = janitor })).step);
+    const calibration = b.createModule(.{ .root_source_file = b.path("src/calibration.zig"), .target = target, .optimize = optimize });
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = calibration })).step);
     const rpc_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("src/lua/wire.zig"),
         .target = target,
@@ -151,6 +212,8 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     }) });
     podman_check.root_module.addImport("resource", resource);
+    podman_check.root_module.addImport("podman", podman);
+    podman_check.root_module.addImport("janitor", janitor);
     podman_check.root_module.addImport("history", history_tests.root_module);
     podman_check.root_module.addImport("pipe", pipe_tests.root_module);
     podman_check.root_module.linkSystemLibrary("libcurl", .{});

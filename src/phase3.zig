@@ -18,7 +18,7 @@ pub const Service = struct {
     channel: rpc.Channel,
     options: download.Options,
 
-    const Ticket = struct {
+    pub const Ticket = struct {
         invoker_id: []const u8,
         epoch: []const u8,
         attempt_id: []const u8,
@@ -163,9 +163,37 @@ pub const Service = struct {
         _ = try self.claimAssigned(assignment, process_epoch, false);
     }
 
-    /// Fixture handoff: claim and fsync the lease without downloading inputs.
+    /// Claim and fsync the lease without downloading inputs.
     pub fn pinAssigned(self: Service, assignment: job.Job, process_epoch: []const u8) !rpc.Claim {
         return self.claimAssigned(assignment, process_epoch, true);
+    }
+
+    pub const ClaimIntent = struct { epoch: []const u8, job: job.Job, invoker: []const u8 };
+
+    pub fn loadClaim(self: Service, run: []const u8) !ClaimIntent {
+        if (!job.validId(run)) return error.ClaimIntentMismatch;
+        const a = self.allocator;
+        const path = try std.fmt.allocPrint(a, "claim-intents/{s}", .{run});
+        const saved = try self.state.readFileAlloc(self.io, path, a, .limited(16 << 10));
+        const record = try std.json.parseFromSliceLeaky(ClaimIntent, a, saved, .{});
+        const canonical = try std.json.Stringify.valueAlloc(a, record.job, .{});
+        const parsed = try job.parse(a, canonical);
+        defer parsed.deinit();
+        if (!std.mem.eql(u8, record.job.run_id, run) or !std.mem.eql(u8, record.invoker, self.invoker_id) or !job.validId(record.epoch)) return error.ClaimIntentMismatch;
+        return record;
+    }
+
+    pub fn loadTicket(self: Service, run: []const u8) !Ticket {
+        if (!job.validId(run)) return error.ClaimIntentMismatch;
+        const path = try std.fmt.allocPrint(self.allocator, "claim-intents/pin-{s}", .{run});
+        const saved = try self.state.readFileAlloc(self.io, path, self.allocator, .limited(2048));
+        return std.json.parseFromSliceLeaky(Ticket, self.allocator, saved, .{});
+    }
+
+    /// Recover just this run's artifact into its first event before producing scores.
+    pub fn recordArtifact(self: Service, journal: *upload.Journal, events: *outbox.Outbox, pending: upload.Pending) !void {
+        const payloads = try std.fs.path.join(self.allocator, &.{ self.root, "upload-spool" });
+        try self.recoverEntry(journal, events, payloads, pending);
     }
 
     fn claimAssigned(self: Service, assignment: job.Job, process_epoch: []const u8, pin_only: bool) !rpc.Claim {
@@ -184,8 +212,7 @@ pub const Service = struct {
         intent.link(io) catch |err| if (err != error.PathAlreadyExists) return err;
         try sync(intents);
         const saved = try intents.readFileAlloc(io, assignment.run_id, a, .limited(16 << 10));
-        const Saved = struct { epoch: []const u8, job: job.Job, invoker: []const u8 };
-        const record = try std.json.parseFromSliceLeaky(Saved, a, saved, .{});
+        const record = try std.json.parseFromSliceLeaky(ClaimIntent, a, saved, .{});
         if (!std.meta.eql(record.job, assignment) or !std.mem.eql(u8, record.invoker, self.invoker_id)) {
             const expected = try std.json.Stringify.valueAlloc(a, assignment, .{});
             const previous = try std.json.Stringify.valueAlloc(a, record.job, .{});
@@ -339,7 +366,7 @@ pub const Service = struct {
     }
 };
 
-fn now(io: std.Io) lease.Time {
+pub fn now(io: std.Io) lease.Time {
     return .{ .unix_seconds = std.Io.Clock.real.now(io).toSeconds(), .monotonic_ns = std.Io.Clock.awake.now(io).nanoseconds };
 }
 
@@ -350,7 +377,7 @@ fn secureDirectory(dir: std.Io.Dir) !void {
         !stat.mask.MODE or !stat.mask.UID or stat.uid != linux.geteuid() or stat.mode & 0o077 != 0) return error.UnsafeArtifactDirectory;
 }
 
-fn sync(dir: std.Io.Dir) !void {
+pub fn sync(dir: std.Io.Dir) !void {
     const linux = std.os.linux;
     while (true) switch (linux.errno(linux.fsync(dir.handle))) {
         .SUCCESS => return,

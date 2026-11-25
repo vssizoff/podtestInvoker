@@ -1,5 +1,5 @@
 const std = @import("std");
-const podman = @import("client.zig");
+const podman = @import("podman");
 const resource = @import("resource");
 const History = @import("history").History;
 const group = @import("group.zig");

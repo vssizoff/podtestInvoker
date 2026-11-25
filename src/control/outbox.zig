@@ -59,6 +59,18 @@ pub const Outbox = struct {
     /// and event ID in its wire message. It may return borrowed bytes, valid
     /// until enqueue returns. The encoder must not reenter the outbox.
     pub fn enqueue(self: *Outbox, allocator: std.mem.Allocator, run_id: []const u8, encoder: anytype) !u64 {
+        return self.enqueueInternal(allocator, run_id, null, encoder);
+    }
+
+    /// Resume a producer whose immutable result plan assigns fixed run ordinals.
+    /// An already journaled ordinal is never encoded again, even after ACK.
+    /// The caller must exclusively own this ordinal range for the run.
+    pub fn enqueueAt(self: *Outbox, allocator: std.mem.Allocator, run_id: []const u8, ordinal: u64, encoder: anytype) !u64 {
+        if (ordinal == 0) return error.InvalidEventOrdinal;
+        return self.enqueueInternal(allocator, run_id, ordinal, encoder);
+    }
+
+    fn enqueueInternal(self: *Outbox, allocator: std.mem.Allocator, run_id: []const u8, ordinal: ?u64, encoder: anytype) !u64 {
         if (run_id.len == 0 or run_id.len > 255) return error.InvalidRunId;
         const records = try self.replay(allocator);
         defer freeRecords(allocator, records);
@@ -71,10 +83,14 @@ pub const Outbox = struct {
             if (record.kind != .run_event and record.kind != .run_cursor) continue;
             const entry = try runEntry(record.payload, record.kind);
             if (!std.mem.eql(u8, entry.run_id, run_id)) continue;
-            if (@hasDecl(Encoder, "matchesPending") and record.kind == .run_event) {
+            if (@hasDecl(Encoder, "matchesPending") and ordinal == null and record.kind == .run_event) {
                 if (try encoder.matchesPending(entry.wire)) return entry.sequence;
             }
             last = @max(last, entry.sequence);
+        }
+        if (ordinal) |expected| {
+            if (expected <= last) return expected;
+            if (expected - 1 != last) return error.EventOrdinalGap;
         }
         const next = std.math.add(u64, last, 1) catch return error.SequenceExhausted;
         var event_id: [16]u8 = undefined;
@@ -126,6 +142,18 @@ pub const Outbox = struct {
             count += 1;
         }
         return count;
+    }
+
+    pub fn flushRun(self: *Outbox, allocator: std.mem.Allocator, run_id: []const u8, reporter: anytype) !void {
+        const records = try self.replay(allocator);
+        defer freeRecords(allocator, records);
+        for (records) |record| {
+            if (record.kind != .run_event) continue;
+            const entry = try runEntry(record.payload, .run_event);
+            if (!std.mem.eql(u8, entry.run_id, run_id)) continue;
+            try reporter.report(entry.wire);
+            try self.acknowledge(record.sequence);
+        }
     }
 
     /// Attempt one ordered drain per run. Transport rejections leave that
@@ -612,6 +640,38 @@ test "per-run event ordinals survive ACK, compaction, and process restart" {
     const cursor = try runEntry(records[0].payload, .run_cursor);
     try std.testing.expectEqualStrings("run-b", cursor.run_id);
     try std.testing.expectEqual(@as(u64, 1), cursor.sequence);
+}
+
+test "fixed ordinals resume after ACK and compaction" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    const parent = try std.Io.Dir.cwd().realPathFileAlloc(io, ".zig-cache/tmp", a);
+    defer a.free(parent);
+    const name = try std.fmt.allocPrint(a, "{s}/{s}", .{ parent, &temp.sub_path });
+    defer a.free(name);
+    var encoder: EventEncoder = .{};
+    {
+        var wal = try Outbox.open(io, name, 2048);
+        defer wal.close();
+        try std.testing.expectError(error.EventOrdinalGap, wal.enqueueAt(a, "run", 2, &encoder));
+        try std.testing.expectEqual(@as(u64, 1), try wal.enqueueAt(a, "run", 1, &encoder));
+        try std.testing.expectEqual(@as(usize, 1), try wal.flush(a, struct {
+            pub fn report(_: @This(), _: []const u8) !void {}
+        }{}));
+        try wal.compact(a);
+    }
+    var wal = try Outbox.open(io, name, 2048);
+    defer wal.close();
+    const NoEncode = struct {
+        pub fn encode(_: @This(), _: []const u8, _: u64, _: [16]u8) ![]const u8 {
+            return error.UnexpectedReencode;
+        }
+    };
+    try std.testing.expectEqual(@as(u64, 1), try wal.enqueueAt(a, "run", 1, NoEncode{}));
+    try std.testing.expectEqual(@as(u64, 2), try wal.enqueueAt(a, "run", 2, &encoder));
+    try std.testing.expectEqual(@as(u64, 2), try wal.enqueueAt(a, "run", 2, NoEncode{}));
 }
 
 test "opening a legacy journal never truncates it" {

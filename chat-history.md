@@ -29,3 +29,9 @@ This recap covers the documented Phase 2–3 integration gaps and the acceptance
 - Closed for the documented v1 subset. A verified USTAR bundle and pinned submission feed an offline build for POSIX shell or JavaScript. The executor runs sequential tests on rootless Podman, checks exact bytes or ASCII tokens, and scores groups in integer thousandths of a point.
 - A live run exposed a Podman timeout when killing a container with a backed-up attach stream. Closing the stream before killing the container fixed the regression. Debug and ReleaseSafe unit tests, Standard acceptance, and Podman regressions passed. Cancellation left no `result.json`, and no Phase 7 containers, image tags, or fixture directories remained.
 - Backend Polygon normalization and production job dispatch remain outstanding. Custom languages, `testlib` checkers, and interactors are outside the v1 subset. [Standard Executor](docs/standard-executor.md)
+
+## Phase 8 · Hardening (partial)
+
+- Added a locked ownership journal, periodic recovery, and `sweep-resources`. Eight live rootless Podman rounds recovered 48 containers, internal networks, and temporary image tags in total, with cross-instance and shared base image checks.
+- Verified SIGKILL outbox replay and the standalone JetStream fixture. Added a ReleaseSafe CPU calibration command and the `install-diagnostics` staging target. Untagged build leftovers, fleet load and production dispatch/reporting remain open. [Phase 8 runbook](docs/phase8.md)
+- Connected the opt-in one-slot Standard worker to the Backend durable queue, pinned claims, rootless execution, artifact staging and fixed-ordinal reporting. Verified a real shell submission and replay after SIGKILL between terminal commit and ACK. Verified one replacement after an expired lease, execution in `serve-standard` and shutdown via SIGTERM. The target deployment still needs configuration and validation. [Phase 8 runbook](docs/phase8.md)
