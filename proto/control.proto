@@ -1,0 +1,114 @@
+syntax = "proto3";
+package podtest.invoker.v1;
+option go_package = "podtest/internal/invokerpb";
+
+// Proposed pull protocol: jobs are advertised on JetStream; a claim is mandatory
+// before execution. IDs are UUIDs. Artifact bytes are never sent over gRPC.
+service Control {
+  rpc Heartbeat(HeartbeatRequest) returns (Acknowledgement);
+  rpc Claim(ClaimRequest) returns (ClaimResponse);
+  rpc Report(Event) returns (Acknowledgement);
+  rpc CreateArtifactUpload(CreateArtifactUploadRequest) returns (ArtifactUploadTarget);
+  rpc CompleteArtifactUpload(CompleteArtifactUploadRequest) returns (Acknowledgement);
+  rpc RenewArtifactUpload(RenewArtifactUploadRequest) returns (ArtifactUploadTarget);
+  rpc RefreshArtifacts(RunLease) returns (ClaimResponse);
+  rpc RenewLease(RunLease) returns (RenewLeaseResponse);
+}
+message HeartbeatRequest {
+  string invoker_id = 1;
+  uint32 protocol_version = 2;
+  repeated string execution_formats = 3;
+  uint32 capacity = 4;
+  uint32 load = 5;
+}
+message ClaimRequest {
+  string invoker_id = 1;
+  string attempt_id = 2;
+  string run_id = 3;
+  string process_epoch = 4;
+}
+message ClaimResponse {
+  int64 lease_expires_unix = 1;
+  string source_url = 2;
+  string bundle_url = 3;
+  bytes fencing_token = 4;
+  ArtifactDescriptor source = 5;
+  ArtifactDescriptor bundle = 6;
+}
+message Event {
+  bytes event_id = 1;
+  string attempt_id = 2;
+  string run_id = 3;
+  string submission_id = 4;
+  string invoker_id = 5;
+  uint64 sequence = 6;
+  uint32 schema_version = 7;
+  int64 occurred_at_unix_millis = 8;
+  Kind kind = 9;
+  string verdict = 10;
+  optional string score = 11; // Exact decimal; up to six fractional digits.
+  string test_id = 12;
+  string subgroup_id = 13;
+  string artifact_id = 14;
+  bytes fencing_token = 15;
+  string outcome = 16; // RUN_FINISHED only; separate from the submission verdict.
+  enum Kind {
+    UNKNOWN = 0;
+    RUN_STARTED = 1;
+    BUILD_STARTED = 2;
+    BUILD_LOG_CHUNK = 3;
+    BUILD_FINISHED = 4;
+    TEST_STARTED = 5;
+    TEST_FINISHED = 6;
+    SUBGROUP_SCORE = 7;
+    PROBLEM_SCORE = 8;
+    ARTIFACT_CREATED = 9;
+    RUNNER_ERROR = 10;
+    RUN_TIMEOUT = 11;
+    RUN_CANCELLED = 12;
+    RUN_FINISHED = 13;
+  }
+}
+message Acknowledgement { bool duplicate = 1; }
+
+message ArtifactDescriptor {
+  bytes sha256 = 1;
+  uint64 size_bytes = 2;
+}
+
+message RunLease {
+  string invoker_id = 1;
+  string process_epoch = 2;
+  string attempt_id = 3;
+  string run_id = 4;
+  bytes fencing_token = 5;
+}
+
+message RenewLeaseResponse {
+  int64 lease_expires_unix = 1;
+}
+
+message CreateArtifactUploadRequest {
+  RunLease lease = 1;
+  string client_artifact_id = 2;
+  string kind = 3;
+  ArtifactDescriptor artifact = 4;
+}
+
+message ArtifactUploadTarget {
+  string artifact_id = 1;
+  string put_url = 2;
+  int64 expires_at_unix_millis = 3;
+  map<string, string> required_headers = 4;
+  bool complete = 5;
+}
+
+message CompleteArtifactUploadRequest {
+  RunLease lease = 1;
+  string artifact_id = 2;
+}
+
+message RenewArtifactUploadRequest {
+  RunLease lease = 1;
+  string artifact_id = 2;
+}

@@ -1,0 +1,20 @@
+[Unit]
+Description=Podtest Invoker host diagnostics
+Requires=podman.socket
+After=network-online.target podman.socket
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/podtest-invoker serve-diagnostics /etc/podtest-invoker/config.json
+Restart=on-failure
+RestartSec=3
+UMask=0077
+StateDirectory=podtest-invoker
+StateDirectoryMode=0700
+Environment=PODTEST_STATE_DIR=%S/podtest-invoker
+LimitNOFILE=65536
+KillMode=control-group
+TimeoutStopSec=10
+
+[Install]
+WantedBy=default.target

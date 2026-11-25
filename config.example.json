@@ -1,0 +1,10 @@
+{
+  "invoker_id": "replace-with-stable-node-id",
+  "state_dir": "/var/lib/podtest-invoker",
+  "podman_socket": "",
+  "libpod_api_version": "6.2.0",
+  "max_active_runs": 1,
+  "run_timeout_seconds": 300,
+  "stop_grace_ms": 500,
+  "stdio_limit_bytes": 536870912
+}

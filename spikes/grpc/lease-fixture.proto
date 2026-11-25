@@ -1,0 +1,11 @@
+syntax = "proto3";
+package podtest.invoker.v1;
+option go_package = "podtest/internal/invokerpb";
+
+import "control-v2-proposal.proto";
+
+// Test-only service: the canonical Control service remains unchanged.
+service LeaseFixture {
+  rpc RenewLease(RenewLeaseRequest) returns (RenewLeaseResponse);
+  rpc WatchCommands(WatchCommandsRequest) returns (stream Command);
+}

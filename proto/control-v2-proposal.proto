@@ -1,0 +1,32 @@
+syntax = "proto3";
+package podtest.invoker.v1;
+option go_package = "podtest/internal/invokerpb";
+
+// Review-only lease and event metadata additions. Artifact upload RPCs and
+// ArtifactDescriptor are defined in the adopted control.proto contract.
+// Integrate these remaining additions after Backend approval.
+// Proposed additions to Event:
+//   string task_revision_id = 16;
+//   bytes task_bundle_sha256 = 17; string checker_metadata = 18;
+//   ArtifactDescriptor artifact = 19;
+
+import "control.proto";
+
+message RenewLeaseRequest { RunLease lease = 1; }
+message RenewLeaseResponse { int64 lease_expires_unix = 1; }
+
+message WatchCommandsRequest {
+  string invoker_id = 1;
+  string process_epoch = 2;
+}
+
+message CancelRun {
+  RunLease lease = 1;
+  string reason = 2;
+  int64 deadline_unix_millis = 3;
+}
+
+message Command {
+  string command_id = 1;
+  oneof payload { CancelRun cancel_run = 2; }
+}

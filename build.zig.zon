@@ -1,0 +1,15 @@
+.{
+    .name = .podtest_invoker,
+    .version = "0.1.0",
+    .fingerprint = 0x2470a19020483796,
+    // Tested toolchain: Zig 0.17.1.
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{
+        .nats = .{
+            .url = "git+https://github.com/nats-io/nats.zig#7f1ad603b6495cb10fed5eee628d845fe214c601",
+            .hash = "nats-0.1.0-991asUeTHwBdTug5WfNzPnvxGbT9ZrEJCrjXClbqqBvg",
+            .lazy = true,
+        },
+    },
+    .paths = .{ "README.md", "build.zig", "build.zig.zon", "src", "proto", "docs", "deploy", "config.example.json", "spikes" },
+}
