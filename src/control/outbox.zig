@@ -70,6 +70,18 @@ pub const Outbox = struct {
         return self.enqueueInternal(allocator, run_id, ordinal, encoder);
     }
 
+    pub fn lastRunOrdinal(self: *Outbox, allocator: std.mem.Allocator, run_id: []const u8) !u64 {
+        const records = try self.replay(allocator);
+        defer freeRecords(allocator, records);
+        var last: u64 = 0;
+        for (records) |record| {
+            if (record.kind != .run_event and record.kind != .run_cursor) continue;
+            const entry = try runEntry(record.payload, record.kind);
+            if (std.mem.eql(u8, entry.run_id, run_id)) last = @max(last, entry.sequence);
+        }
+        return last;
+    }
+
     fn enqueueInternal(self: *Outbox, allocator: std.mem.Allocator, run_id: []const u8, ordinal: ?u64, encoder: anytype) !u64 {
         if (run_id.len == 0 or run_id.len > 255) return error.InvalidRunId;
         const records = try self.replay(allocator);

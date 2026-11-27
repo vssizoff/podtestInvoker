@@ -1,9 +1,11 @@
 const std = @import("std");
 const podman = @import("podman");
+const Workspace = @import("workspace.zig").Workspace;
 const Command = [*:null]?[*:0]const u8;
 const Read = *const fn (?*anyopaque, c_uint, [*]u8, *usize) callconv(.c) c_int;
 const Cancel = *const fn (?*anyopaque) callconv(.c) c_int;
 extern "c" fn podtest_lua_supervise(argv: Command, script: [*]const u8, len: usize, timeout_ms: u32, read: ?Read, cancel: ?Cancel, context: ?*anyopaque) c_int;
+extern "c" fn podtest_lua_supervise_workspace(argv: Command, script: [*]const u8, len: usize, timeout_ms: u32, read: ?Read, workspace: @TypeOf(&Workspace.readRpc), cancel: ?Cancel, context: ?*anyopaque) c_int;
 
 pub fn main(init: std.process.Init) u8 {
     run(init) catch |err| {
@@ -54,6 +56,7 @@ fn run(init: std.process.Init) !void {
     const script = "local j=require('judge.runtime'); local a=j.spawn(function() assert(j.fixture_echo('alpha')=='alpha'); print('rpc alpha') end); local b=j.spawn(function() assert(j.fixture_echo('beta')=='beta'); print('rpc beta') end); j.join(a); j.join(b)";
     const rc = podtest_lua_supervise(command, script.ptr, script.len, 5000, null, null, null);
     if (rc != 0) return error.RunnerFailed;
+    try checkWorkspace(init, command);
     const sleeper = "local j=require('judge.runtime'); while true do j.sleep(100) end";
     if (podtest_lua_supervise(command, sleeper.ptr, sleeper.len, 1000, null, null, null) != -2) return error.WatchdogFailed;
     const Cancellation = struct {
@@ -66,6 +69,34 @@ fn run(init: std.process.Init) !void {
     var checks: usize = 0;
     if (podtest_lua_supervise(command, sleeper.ptr, sleeper.len, 5000, null, Cancellation.check, &checks) != -3) return error.CancellationFailed;
     if (init.environ_map.get("PODTEST_PODMAN_SOCKET")) |socket| try checkContainers(init, command, socket) else if (require_podman) return error.ExpectedPodmanSocket;
+}
+
+fn checkWorkspace(init: std.process.Init, command: Command) !void {
+    const io = init.io;
+    const temp = try std.Io.Dir.openDirAbsolute(io, "/tmp", .{});
+    defer temp.close(io);
+    var random: [16]u8 = undefined;
+    try io.randomSecure(&random);
+    const name = try std.fmt.allocPrint(init.arena.allocator(), "podtest-lua-{x}", .{&random});
+    try temp.createDir(io, name, .fromMode(0o700));
+    defer temp.deleteTree(io, name) catch {};
+    const dir = try temp.openDir(io, name, .{ .follow_symlinks = false });
+    defer dir.close(io);
+    try dir.createDir(io, "tests", .fromMode(0o700));
+    try dir.writeFile(io, .{ .sub_path = "tests/input", .data = "abcdef" });
+    try dir.symLink(io, "tests/input", "link", .{});
+    try dir.symLink(io, "tests", "linked-dir", .{ .is_directory = true });
+    var workspace: Workspace = .{ .io = io, .dir = dir };
+    const script =
+        \\local j = require('judge.runtime')
+        \\assert(j.workspace_read('tests/input', 2) == 'cdef')
+        \\assert(j.workspace_read('tests/input', 6) == nil)
+        \\for _, path in ipairs({'../tests/input', '/tests/input', 'tests//input', 'link', 'linked-dir/input'}) do
+        \\  assert(not pcall(j.workspace_read, path), path)
+        \\end
+    ;
+    if (podtest_lua_supervise_workspace(command, script.ptr, script.len, 5000, null, &Workspace.readRpc, null, &workspace) != 0)
+        return error.WorkspaceRpcFailed;
 }
 
 const Streams = struct {

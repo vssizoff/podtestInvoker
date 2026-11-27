@@ -30,8 +30,10 @@ fn run(init: std.process.Init) !void {
     const prepare = std.mem.eql(u8, args[1], "prepare-assigned");
     const stage = std.mem.eql(u8, args[1], "stage-artifact");
     const fixture = std.mem.eql(u8, args[1], "test-claim-delivery");
+    const lua_once = std.mem.eql(u8, args[1], "work-lua-once");
+    const lua_worker = lua_once or std.mem.eql(u8, args[1], "serve-lua");
     const standard_once = std.mem.eql(u8, args[1], "work-standard-once");
-    const standard = standard_once or std.mem.eql(u8, args[1], "serve-standard");
+    const standard = lua_worker or standard_once or std.mem.eql(u8, args[1], "serve-standard");
     const sweep = std.mem.eql(u8, args[1], "sweep-resources") or std.mem.eql(u8, args[1], "sweep-containers");
     const calibrate = std.mem.eql(u8, args[1], "calibrate-cpu");
     if (!check and !serve and !artifacts and !prepare and !stage and !fixture and !standard and !sweep and !calibrate) return error.InvalidArguments;
@@ -81,7 +83,7 @@ fn run(init: std.process.Init) !void {
     if (standard) {
         if (comptime !@import("build_options").standard_worker) return error.StandardWorkerNotBuilt;
         try sweepContainers(init, journal, client, true, signal_fd);
-        return @import("standard_worker.zig").run(init, config, journal, client, signal_fd, standard_once);
+        return @import("standard_worker.zig").run(init, config, journal, client, signal_fd, standard_once or lua_once, lua_worker);
     }
     if (sweep or serve) {
         try sweepContainers(init, journal, client, sweep, if (serve) signal_fd else null);

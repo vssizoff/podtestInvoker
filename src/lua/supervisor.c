@@ -84,6 +84,17 @@ extern int podtest_lua_validate(const struct rpc_boot *, const struct rpc_reques
 /* argv is trusted host configuration, not supplied by the Lua script. */
 int podtest_lua_supervise(char *const argv[], const char *script, size_t len, unsigned timeout_ms,
     rpc_read_fn read_stdout, rpc_cancel_fn cancelled, void *context) {
+    return podtest_lua_supervise_workspace(argv, script, len, timeout_ms, read_stdout, NULL, cancelled, context);
+}
+
+int podtest_lua_supervise_workspace(char *const argv[], const char *script, size_t len, unsigned timeout_ms,
+    rpc_read_fn read_stdout, rpc_workspace_read_fn read_workspace, rpc_cancel_fn cancelled, void *context) {
+    return podtest_lua_supervise_run(argv, script, len, timeout_ms, read_stdout, read_workspace, NULL, cancelled, context, -1);
+}
+
+int podtest_lua_supervise_run(char *const argv[], const char *script, size_t len, unsigned timeout_ms,
+    rpc_read_fn read_stdout, rpc_workspace_read_fn read_workspace, rpc_dispatch_fn dispatch,
+    rpc_cancel_fn cancelled, void *context, int log_fd) {
     if (!argv || !argv[0] || argv[0][0] != '/' || len > 256 * 1024 || !timeout_ms || timeout_ms > 300000 ||
         !getuid() || !getgid()) return -1;
     struct rpc_boot boot = { .deadline_ms = monotonic_ms() + timeout_ms, .script_len = len, .version = RPC_VERSION };
@@ -97,6 +108,7 @@ int podtest_lua_supervise(char *const argv[], const char *script, size_t len, un
     pid_t child = fork();
     if (!child) {
         close(fd[0]);
+        if (log_fd >= 0 && (dup2(log_fd, STDOUT_FILENO) < 0 || dup2(log_fd, STDERR_FILENO) < 0)) _exit(125);
         if (setpgid(0, 0) || dup2(fd[1], STDIN_FILENO) < 0 ||
             fcntl(STDIN_FILENO, F_SETFD, 0) || syscall(SYS_close_range, 3u, ~0u, 0u)) _exit(125);
         char *const env[] = { NULL };
@@ -118,6 +130,7 @@ int podtest_lua_supervise(char *const argv[], const char *script, size_t len, un
         offset += chunk;
     }
     uint64_t last_id = 0;
+    size_t requests = 0;
     pid_t runner = 0;
     struct { uint64_t id, deadline; unsigned handle; } pending[32] = {0};
     for (;;) {
@@ -158,6 +171,7 @@ int podtest_lua_supervise(char *const argv[], const char *script, size_t len, un
             (runner && runner != peer.pid)) goto done;
         size_t payload_len = (size_t)n - offsetof(struct rpc_request, payload);
         if (podtest_lua_validate(&boot, &request, payload_len, last_id, monotonic_ms())) goto done;
+        if (++requests > 32768) goto done;
         runner = peer.pid;
         last_id = request.id;
         if (request.method == RPC_STDOUT_READ) {
@@ -173,7 +187,27 @@ int podtest_lua_supervise(char *const argv[], const char *script, size_t len, un
         }
         struct rpc_reply reply = { .id = request.id, .version = RPC_VERSION };
         memcpy(reply.run_id, boot.run_id, sizeof(reply.run_id));
-        memcpy(reply.payload, request.payload, payload_len);
+        if (request.method == RPC_WORKSPACE_READ) {
+            uint32_t offset;
+            memcpy(&offset, request.payload, sizeof(offset));
+            size_t size = sizeof(reply.payload);
+            int rc = read_workspace ? read_workspace(context, request.payload + sizeof(offset), payload_len - sizeof(offset), offset, reply.payload, &size) : -1;
+            if (rc != 1 || size > sizeof(reply.payload)) {
+                reply.status = rc == 2 ? RPC_EOF : RPC_IO_ERROR;
+                size = 0;
+            }
+            payload_len = size;
+        } else if (request.method == RPC_ECHO && !dispatch) {
+            memcpy(reply.payload, request.payload, payload_len);
+        } else {
+            size_t size = sizeof(reply.payload);
+            int rc = dispatch ? dispatch(context, request.method, request.payload, payload_len, reply.payload, &size) : -1;
+            if (rc != 1 || size > sizeof(reply.payload)) {
+                reply.status = rc == 2 ? RPC_EOF : RPC_IO_ERROR;
+                size = 0;
+            }
+            payload_len = size;
+        }
         sent = packet(fd[0], &reply, offsetof(struct rpc_reply, payload) + payload_len, request.deadline_ms, cancelled, context);
         if (sent) { result = sent; goto done; }
     }

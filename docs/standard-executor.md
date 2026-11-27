@@ -1,5 +1,19 @@
 # Standard Executor v1
 
+Deploy the Backend that accepts progress reports before updating Standard
+workers. Workers report `RUN_STARTED`, `BUILD_STARTED`, `BUILD_FINISHED`,
+and `TEST_STARTED` through the same durable, ordered outbox as results.
+Test results are still published together at the end of the run. When a
+worker restarts execution before the result is durable, it reuses the
+progress ordinals for the pinned task and replays any unacknowledged report.
+
+An active run receives a cancellation request in `RenewLease`. The worker
+stops execution, verifies removal of its owned Podman resources, and records
+`RUN_CANCELLED` in the outbox. A lost acknowledgement is replayed after a
+restart. A run that already entered final reporting may commit its result
+before its lease expires. A pending cancellation prevents further lease
+extension and prevents automatic retry after expiry.
+
 `src/standard/contract.zig` owns the initial Backend/Invoker contract. The
 outer bundle remains the common USTAR v1 format; it must declare
 `execution_format: "standard"` and version 1. `standard.json` is a separate,

@@ -213,6 +213,63 @@ static int rpc_stdout_read(lua_State *L) {
     return rpc_call(L, RPC_STDOUT_READ, &byte, 1);
 }
 
+static int rpc_workspace_read(lua_State *L) {
+    size_t len;
+    const char *path = luaL_checklstring(L, 1, &len);
+    lua_Integer offset = luaL_optinteger(L, 2, 0);
+    luaL_argcheck(L, len > 0 && len <= 256, 1, "invalid workspace path length");
+    luaL_argcheck(L, offset >= 0 && offset <= UINT32_MAX, 2, "invalid workspace offset");
+    uint32_t position = (uint32_t)offset;
+    char payload[sizeof(position) + 256];
+    memcpy(payload, &position, sizeof(position));
+    memcpy(payload + sizeof(position), path, len);
+    return rpc_call(L, RPC_WORKSPACE_READ, payload, sizeof(position) + len);
+}
+
+static int rpc_container_open(lua_State *L) {
+    size_t len;
+    const char *path = luaL_checklstring(L, 1, &len);
+    luaL_argcheck(L, len > 0 && len <= 256, 1, "invalid workspace path length");
+    return rpc_call(L, RPC_CONTAINER_OPEN, path, len);
+}
+
+static int container_handle(lua_State *L, unsigned method) {
+    lua_Integer handle = luaL_checkinteger(L, 1);
+    luaL_argcheck(L, handle >= 1 && handle <= 8, 1, "invalid container handle");
+    char byte = (char)handle;
+    return rpc_call(L, method, &byte, 1);
+}
+
+static int rpc_container_close(lua_State *L) { return container_handle(L, RPC_CONTAINER_CLOSE); }
+static int rpc_container_status(lua_State *L) { return container_handle(L, RPC_CONTAINER_STATUS); }
+
+static int report_result(lua_State *L, unsigned method) {
+    size_t id_len = 0, verdict_len = 0;
+    const char *id = NULL, *verdict = NULL;
+    int score_arg = 1;
+    if (method != RPC_PROBLEM_SCORE) {
+        id = luaL_checklstring(L, score_arg++, &id_len);
+        luaL_argcheck(L, id_len > 0 && id_len <= 64, 1, "invalid result ID length");
+    }
+    if (method == RPC_TEST_VERDICT) {
+        verdict = luaL_checklstring(L, score_arg++, &verdict_len);
+        luaL_argcheck(L, verdict_len > 0 && verdict_len <= 64, 2, "invalid verdict length");
+    }
+    lua_Integer score = luaL_checkinteger(L, score_arg);
+    luaL_argcheck(L, score >= 0, score_arg, "score must be nonnegative milli-points");
+    uint64_t value = (uint64_t)score;
+    char payload[8 + 64 + 1 + 64];
+    size_t size = sizeof(value);
+    memcpy(payload, &value, size);
+    if (id) { memcpy(payload + size, id, id_len); size += id_len; }
+    if (verdict) { payload[size++] = 0; memcpy(payload + size, verdict, verdict_len); size += verdict_len; }
+    return rpc_call(L, method, payload, size);
+}
+
+static int rpc_test_verdict(lua_State *L) { return report_result(L, RPC_TEST_VERDICT); }
+static int rpc_subgroup_score(lua_State *L) { return report_result(L, RPC_SUBGROUP_SCORE); }
+static int rpc_problem_score(lua_State *L) { return report_result(L, RPC_PROBLEM_SCORE); }
+
 static void rpc_receive(struct budget *b) {
     struct rpc_reply reply;
     ssize_t n = recv(STDIN_FILENO, &reply, sizeof(reply), MSG_DONTWAIT | MSG_TRUNC);
@@ -315,6 +372,20 @@ static int run(lua_State *L) {
     lua_setfield(L, -2, "fixture_echo");
     lua_pushcfunction(L, rpc_stdout_read);
     lua_setfield(L, -2, "stdout_read");
+    lua_pushcfunction(L, rpc_workspace_read);
+    lua_setfield(L, -2, "workspace_read");
+    lua_pushcfunction(L, rpc_container_open);
+    lua_setfield(L, -2, "container_open");
+    lua_pushcfunction(L, rpc_container_close);
+    lua_setfield(L, -2, "container_close");
+    lua_pushcfunction(L, rpc_container_status);
+    lua_setfield(L, -2, "container_status");
+    lua_pushcfunction(L, rpc_test_verdict);
+    lua_setfield(L, -2, "test_verdict");
+    lua_pushcfunction(L, rpc_subgroup_score);
+    lua_setfield(L, -2, "subgroup_score");
+    lua_pushcfunction(L, rpc_problem_score);
+    lua_setfield(L, -2, "problem_score");
     lua_pushcclosure(L, require_builtin, 1);
     lua_setglobal(L, "require");
 

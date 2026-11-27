@@ -12,7 +12,8 @@ pub fn build(b: *std.Build) void {
     const standard_tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("src/standard/contract.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "resource", .module = resource }} }) });
     engine.addImport("podman", podman);
     engine.addImport("janitor", janitor);
-    if (b.option(bool, "lua-runner", "Build the standalone Phase 6 Lua runner") orelse false) {
+    const lua_runner = b.option(bool, "lua-runner", "Build the Lua runner and sandbox supervisor") orelse false;
+    if (lua_runner) {
         const runner = b.addExecutable(.{ .name = "podtest-lua-runner", .root_module = b.createModule(.{
             .target = target,
             .optimize = optimize,
@@ -65,6 +66,11 @@ pub fn build(b: *std.Build) void {
     options.addOption(bool, "claim_fixture", claim_fixture);
     const standard_worker = b.option(bool, "standard-worker", "Build the opt-in Standard queue worker") orelse false;
     options.addOption(bool, "standard_worker", standard_worker);
+    options.addOption(bool, "lua_worker", lua_runner and standard_worker);
+    if (lua_runner and standard_worker) {
+        exe.root_module.addCSourceFile(.{ .file = b.path("src/lua/supervisor.c"), .flags = &.{ "-Wall", "-Wextra", "-Werror" } });
+        exe.root_module.addCSourceFile(.{ .file = b.path("src/lua/rpc_validate.c"), .flags = &.{ "-Wall", "-Wextra", "-Werror" } });
+    }
     if (claim_fixture or standard_worker) {
         if (!grpc_enabled) @panic("JetStream commands require artifact-control");
         const nats = b.lazyDependency("nats", .{ .target = target, .optimize = optimize }) orelse return;

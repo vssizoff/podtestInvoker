@@ -9,7 +9,7 @@ const Result = @import("result.zig").Result;
 /// Artifact events must already own the preceding ordinals for this run.
 pub fn enqueue(box: *Outbox, a: std.mem.Allocator, journal: *upload.Journal, run: upload.Pending, required: []const []const u8, submission: [:0]const u8, stamp: i64, first: u64, result: Result) !void {
     if (result.version != 1 or first == 0 or (result.infrastructure_error and result.compilation_error) or
-        (if (result.infrastructure_error or result.compilation_error) result.tests.len != 0 or result.groups.len != 0 or result.problem_score_milli != 0 else result.tests.len == 0 or result.tests.len > 64 or result.groups.len == 0 or result.groups.len > result.tests.len)) return error.InvalidStandardResult;
+        (if (result.infrastructure_error or result.compilation_error) result.tests.len != 0 or result.groups.len != 0 or result.problem_score_milli != 0 else result.tests.len == 0 or result.tests.len > 64 or result.groups.len > result.tests.len)) return error.InvalidStandardResult;
     const terminal = try std.math.add(u64, first, result.tests.len + result.groups.len + 1);
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();

@@ -44,6 +44,8 @@ test "live RPC validator authenticates requests before dispatch" {
     invalid = req;
     invalid.method = 3;
     try t.expect(podtest_lua_validate(&boot, &invalid, 3, 0, 100) != 0);
+    try t.expect(podtest_lua_validate(&boot, &invalid, 261, 0, 100) != 0);
+    try t.expectEqual(@as(c_int, 0), podtest_lua_validate(&boot, &invalid, 5, 0, 100));
     invalid.method = 2;
     try t.expect(podtest_lua_validate(&boot, &invalid, 3, 0, 100) != 0);
     try t.expectEqual(@as(c_int, 0), podtest_lua_validate(&boot, &invalid, 1, 0, 100));

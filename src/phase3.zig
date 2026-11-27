@@ -276,7 +276,9 @@ pub const Service = struct {
         for (0..3) |attempt| {
             if (!guard.active(now(io))) return error.LeaseInactive;
             if (guard.deadline_ns - now(io).monotonic_ns <= 30 * std.time.ns_per_s) {
-                const expires = try self.channel.renew(&identity);
+                const renewed = try self.channel.renew(&identity);
+                if (renewed.cancel_requested != 0) return error.RunCancellationRequested;
+                const expires = renewed.expires;
                 const received = now(io);
                 if (!guard.active(received)) return error.LeaseInactive;
                 if (expires < guard.expires_unix) return error.NonAdvancingRenewal;

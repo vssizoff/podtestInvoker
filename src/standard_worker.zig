@@ -17,10 +17,14 @@ const report = @import("standard/report.zig");
 const Result = @import("standard/result.zig").Result;
 const Journal = @import("workspace/upload.zig").Journal;
 const Outbox = @import("control/outbox.zig").Outbox;
+const lua = @import("lua/executor.zig");
+const lua_built = @import("build_options").lua_worker;
 
 extern fn podtest_has_disk_space(fd: c_int) c_int;
 
-pub fn run(init: std.process.Init, config: core.Config, journal: janitor.Journal, client: podman.Client, signals: c_int, once: bool) !void {
+pub fn run(init: std.process.Init, config: core.Config, journal: janitor.Journal, client: podman.Client, signals: c_int, once: bool, is_lua: bool) !void {
+    const format: [:0]const u8 = if (is_lua) "scripted_lua" else "standard";
+    const lua_command = if (is_lua) (if (lua_built) try lua.sandboxCommand(init) else return error.LuaWorkerNotBuilt) else null;
     var service = try Service.open(init, config.state_dir, config.invoker_id);
     defer service.close();
     try service.cleanInterruptedInputs();
@@ -43,7 +47,8 @@ pub fn run(init: std.process.Init, config: core.Config, journal: janitor.Journal
     if (images.posix_sh == null and images.javascript == null and images.cpp23 == null and images.python314 == null) return error.StandardImagesNotConfigured;
     // Backend currently schedules by execution format, so a persistent worker
     // has to support the baseline languages published as Standard v1.
-    if (!once and (images.posix_sh == null or images.javascript == null)) return error.StandardImagesNotConfigured;
+    if (is_lua and images.posix_sh == null) return error.StandardImagesNotConfigured;
+    if (!is_lua and !once and (images.posix_sh == null or images.javascript == null)) return error.StandardImagesNotConfigured;
     const buffer = try a.alloc(u8, 128 << 10);
     const Info = struct { host: struct { security: struct { rootless: bool } } };
     const info = try std.json.parseFromSliceLeaky(Info, a, try client.info(buffer), .{ .ignore_unknown_fields = true });
@@ -54,7 +59,7 @@ pub fn run(init: std.process.Init, config: core.Config, journal: janitor.Journal
     if (images.cpp23) |image| try validateImage(a, client, image, buffer);
     if (images.python314) |image| try validateImage(a, client, image, buffer);
 
-    var handler: Handler = .{ .service = service, .journal = journal, .client = client, .signals = signals, .outputs = outputs, .images = images, .timeout = config.run_timeout_seconds };
+    var handler: Handler = .{ .service = service, .journal = journal, .client = client, .signals = signals, .outputs = outputs, .images = images, .timeout = config.run_timeout_seconds, .lua_command = lua_command };
     // A previous process may have received the JetStream ACK or the terminal
     // Report ACK without recording the corresponding local progress.
     while (try handler.recover()) {
@@ -64,14 +69,14 @@ pub fn run(init: std.process.Init, config: core.Config, journal: janitor.Journal
     const connection = try nats.Client.connect(init.gpa, io, url, .{});
     defer connection.deinit();
     var js = try nats.jetstream.JetStream.init(connection, .{});
-    var consumer = try Consumer.bind(&js, "PODTEST_JUDGING", "podtest-standard", "podtest.judging.jobs.v1");
+    var consumer = try Consumer.bind(&js, "PODTEST_JUDGING", if (is_lua) "podtest-scripted-lua" else "podtest-standard", if (is_lua) "podtest.judging.lua.v1" else "podtest.judging.jobs.v1");
     defer service.heartbeat() catch |err| std.log.warn("withdrawing Standard capacity: {s}", .{@errorName(err)});
     var heartbeat_at: i128 = 0;
     while (!stopping(signals)) {
         if (podtest_has_disk_space(service.state.handle) != 1) return error.InsufficientWorkerDisk;
         const stamp = phase3.now(io).monotonic_ns;
         if (heartbeat_at == 0 or stamp >= heartbeat_at) {
-            try service.channel.heartbeat(invoker, 1, 0, "standard");
+            try service.channel.heartbeat(invoker, 1, 0, format);
             heartbeat_at = stamp + 5 * std.time.ns_per_s;
         }
         var arena = std.heap.ArenaAllocator.init(init.gpa);
@@ -102,10 +107,11 @@ const Handler = struct {
     outputs: std.Io.Dir,
     images: executor.Images,
     timeout: u32,
+    lua_command: ?[*:null]?[*:0]const u8,
     token: [32]u8 = undefined,
 
     pub fn claim(self: *Handler, assignment: job.Job) !delivery.Claim {
-        if (assignment.execution_format != .standard) return .retry;
+        if ((assignment.execution_format == .scripted_lua) != (self.lua_command != null)) return .retry;
         const grant = self.service.pinAssigned(assignment, self.journal.epoch) catch |err| switch (err) {
             error.ControlRetry => return .retry,
             error.LeaseInactive => return .stale,
@@ -138,7 +144,7 @@ const Handler = struct {
             var worker = self.*;
             worker.service.allocator = arena.allocator();
             const record = try worker.service.loadClaim(run_id);
-            if (record.job.execution_format != .standard) continue;
+            if ((record.job.execution_format == .scripted_lua) != (self.lua_command != null)) continue;
             if (try worker.hasMarker(run_id, "done")) continue;
             worker.execute(record.job) catch |err| switch (err) {
                 error.LeaseInactive, error.LeaseExpired => continue,
@@ -167,47 +173,166 @@ const Handler = struct {
         if (try exists(io, dir, "done")) return;
         var box = try Outbox.open(io, svc.root, 64 << 20);
         defer box.close();
-        if (try exists(io, dir, "report-ready")) {
+        if (try exists(io, dir, "cancel-first")) {
+            const ticket = try svc.loadTicket(run_id);
+            try self.reportCancellation(dir, &box, ticket, run_id);
+        } else if (try exists(io, dir, "report-ready")) {
             try box.flushRun(a, run_id, svc.channel);
         } else {
             const record = try svc.loadClaim(run_id);
             const grant = try svc.pinAssigned(assignment, record.epoch);
             const ticket = try svc.loadTicket(run_id);
             var control = try Supervisor.init(self.*, ticket, run_id, grant.expires);
-            if (!(try exists(io, dir, "execution/result.json"))) {
-                try svc.prepare(assignment, record.epoch);
-                // An interrupted executor cannot have produced artifact intents
-                // until result.json exists. Its private output can be rebuilt.
-                try dir.deleteTree(io, "execution");
-                try dir.createDir(io, "execution", .fromMode(0o700));
-                try phase3.sync(dir);
-                const execution = try dir.openDir(io, "execution", .{ .iterate = true, .follow_symlinks = false });
-                defer execution.close(io);
-                const workspace_path = try std.fmt.allocPrint(a, "workspaces/{s}", .{run_id});
-                const workspace = try svc.state.openDir(io, workspace_path, .{ .follow_symlinks = false });
-                defer workspace.close(io);
-                try control.checkpoint();
-                executor.runSelected(a, io, self.client, workspace, execution, self.images, assignment.language, .{ .check = Supervisor.cancelled, .context = &control }, .{ .journal = self.journal, .run_id = run_id }) catch |err| return control.failure orelse err;
-            }
-            try control.checkpoint();
-            const log_path = try std.fs.path.join(a, &.{ svc.root, "standard-runs", run_id, "execution", "build.log" });
-            try svc.stage(run_id, run_id, "build_log", log_path);
-            var uploads = try Journal.open(io, try std.fs.path.join(a, &.{ svc.root, "upload-journal" }));
-            defer uploads.close();
-            const pending = try uploads.load(a, run_id);
-            defer pending.deinit();
-            try svc.recordArtifact(&uploads, &box, pending.value);
-            const result_bytes = try dir.readFileAlloc(io, "execution/result.json", a, .limited(256 << 10));
-            const result = try std.json.parseFromSliceLeaky(Result, a, result_bytes, .{});
-            const submission = try a.dupeSentinel(u8, ticket.submission_id, 0);
-            try report.enqueue(&box, a, &uploads, pending.value, &.{run_id}, submission, @intCast(std.Io.Clock.real.now(io).toMilliseconds()), 2, result);
-            try mark(io, dir, "report-ready");
-            try box.flushRun(a, run_id, &control);
+            self.executeAssigned(assignment, dir, &box, record, ticket, &control) catch |err| {
+                if (err != error.RunCancellationRequested) return err;
+                const cleanup = try self.journal.sweepRun(a, self.client, self.signals, run_id);
+                if (cleanup.rejected != 0 or cleanup.unresolved != 0) return error.ContainerRecoveryPending;
+                try box.flushRun(a, run_id, svc.channel);
+                _ = try persistOrdinal(io, dir, &box, a, run_id, "cancel-first", 1);
+                try self.reportCancellation(dir, &box, ticket, run_id);
+            };
         }
         try mark(io, dir, "done");
         try box.compact(a);
     }
+
+    fn reportCancellation(self: *Handler, dir: std.Io.Dir, box: *Outbox, ticket: Service.Ticket, run_id: []const u8) !void {
+        const svc = self.service;
+        const a = svc.allocator;
+        const ordinal = try persistOrdinal(svc.io, dir, box, a, run_id, "cancel-first", 1);
+        var event: rpc.ResultEvent = .{
+            .identity = .{ .invoker = try a.dupeSentinel(u8, ticket.invoker_id, 0), .epoch = try a.dupeSentinel(u8, ticket.epoch, 0), .attempt = try a.dupeSentinel(u8, ticket.attempt_id, 0), .run = try a.dupeSentinel(u8, run_id, 0), .token = ticket.token },
+            .submission = try a.dupeSentinel(u8, ticket.submission_id, 0),
+            .timestamp_ms = @intCast(std.Io.Clock.real.now(svc.io).toMilliseconds()),
+            .result = .cancelled,
+        };
+        _ = try box.enqueueAt(a, run_id, ordinal, &event);
+        try box.flushRun(a, run_id, svc.channel);
+    }
+
+    fn executeAssigned(self: *Handler, assignment: job.Job, dir: std.Io.Dir, box: *Outbox, record: Service.ClaimIntent, ticket: Service.Ticket, control: *Supervisor) !void {
+        const svc = self.service;
+        const io = svc.io;
+        const a = svc.allocator;
+        const run_id = assignment.run_id;
+        const submission = try a.dupeSentinel(u8, ticket.submission_id, 0);
+        // Once final reporting is committed locally, let its ordered
+        // terminal event race the cancellation request at the Backend.
+        const finalizing_marked = try exists(io, dir, "finalizing");
+        control.finalizing = finalizing_marked or try exists(io, dir, "result-first");
+        try control.checkpoint();
+        if (!(try exists(io, dir, "execution/result.json"))) {
+            try svc.prepare(assignment, record.epoch);
+            // An interrupted executor cannot have produced artifact intents
+            // until result.json exists. Its private output can be rebuilt.
+            try dir.deleteTree(io, "execution");
+            try dir.createDir(io, "execution", .fromMode(0o700));
+            try phase3.sync(dir);
+            const execution = try dir.openDir(io, "execution", .{ .iterate = true, .follow_symlinks = false });
+            defer execution.close(io);
+            const workspace_path = try std.fmt.allocPrint(a, "workspaces/{s}", .{run_id});
+            const workspace = try svc.state.openDir(io, workspace_path, .{ .follow_symlinks = false });
+            defer workspace.close(io);
+            try control.checkpoint();
+            if (!(try exists(io, dir, "progress-enabled"))) try mark(io, dir, "progress-enabled");
+            var progress: LiveProgress = .{ .box = box, .allocator = a, .control = control, .submission = submission };
+            try progress.emit(.run_started, null);
+            const cancellation: podman.Cancellation = .{ .check = Supervisor.cancelled, .context = control };
+            if (lua_built and assignment.execution_format == .scripted_lua) {
+                var scripted: lua.Run = .{
+                    .a = a,
+                    .workspace = .{ .io = io, .dir = workspace },
+                    .client = self.client,
+                    .journal = self.journal,
+                    .image = self.images.posix_sh.?,
+                    .run_id = run_id,
+                    .cancellation = cancellation,
+                };
+                // Leave time for cleanup and fenced reporting after the sandbox exits.
+                const timeout_seconds: u32 = @min(self.timeout, 300);
+                scripted.execute(execution, self.lua_command.?, timeout_seconds * 900) catch |err| return control.failure orelse err;
+            } else {
+                executor.runSelected(a, io, self.client, workspace, execution, self.images, assignment.language, cancellation, .{ .journal = self.journal, .run_id = run_id }, .{ .context = &progress, .emit = LiveProgress.observe }) catch |err| return control.failure orelse err;
+            }
+        }
+        try control.checkpoint();
+        if (!finalizing_marked) try mark(io, dir, "finalizing");
+        control.finalizing = true;
+        const first = try resultOrdinal(io, dir, box, a, run_id);
+        const is_lua = assignment.execution_format == .scripted_lua;
+        const log_path = try std.fs.path.join(a, &.{ svc.root, "standard-runs", run_id, "execution", if (is_lua) "runner.log" else "build.log" });
+        try svc.stage(run_id, run_id, if (is_lua) "runner_log" else "build_log", log_path);
+        var uploads = try Journal.open(io, try std.fs.path.join(a, &.{ svc.root, "upload-journal" }));
+        defer uploads.close();
+        const pending = try uploads.load(a, run_id);
+        defer pending.deinit();
+        try svc.recordArtifact(&uploads, box, pending.value);
+        const result_bytes = try dir.readFileAlloc(io, "execution/result.json", a, .limited(256 << 10));
+        const result = try std.json.parseFromSliceLeaky(Result, a, result_bytes, .{});
+        try report.enqueue(box, a, &uploads, pending.value, &.{run_id}, submission, @intCast(std.Io.Clock.real.now(io).toMilliseconds()), first, result);
+        try mark(io, dir, "report-ready");
+        try box.flushRun(a, run_id, control);
+    }
 };
+
+// The executor restarts from its first step if it has no durable result. Its
+// progress markers own the same ordinals on replay for this pinned task.
+const LiveProgress = struct {
+    box: *Outbox,
+    allocator: std.mem.Allocator,
+    control: *Supervisor,
+    submission: [:0]const u8,
+    ordinal: u64 = 1,
+
+    fn emit(self: *LiveProgress, kind: rpc.ProgressEvent.Kind, test_id: ?[:0]const u8) !void {
+        const run_id = std.mem.span(self.control.identity.run);
+        var event: rpc.ProgressEvent = .{
+            .identity = self.control.identity,
+            .submission = self.submission,
+            .timestamp_ms = @intCast(std.Io.Clock.real.now(self.control.io).toMilliseconds()),
+            .kind = kind,
+            .test_id = test_id,
+        };
+        _ = try self.box.enqueueAt(self.allocator, run_id, self.ordinal, &event);
+        try self.box.flushRun(self.allocator, run_id, self.control);
+        self.ordinal += 1;
+    }
+
+    fn observe(context: *anyopaque, event: executor.Progress.Event) !void {
+        const self: *LiveProgress = @ptrCast(@alignCast(context));
+        switch (event) {
+            .build_started => try self.emit(.build_started, null),
+            .build_finished => try self.emit(.build_finished, null),
+            .test_started => |id| try self.emit(.test_started, try self.allocator.dupeSentinel(u8, id, 0)),
+        }
+    }
+};
+
+fn resultOrdinal(io: std.Io, dir: std.Io.Dir, box: *Outbox, allocator: std.mem.Allocator, run_id: []const u8) !u64 {
+    // Older runs start with the build artifact at ordinal 1.
+    if (!(try exists(io, dir, "progress-enabled"))) return 2;
+    return persistOrdinal(io, dir, box, allocator, run_id, "result-first", 2);
+}
+
+fn persistOrdinal(io: std.Io, dir: std.Io.Dir, box: *Outbox, allocator: std.mem.Allocator, run_id: []const u8, name: []const u8, offset: u64) !u64 {
+    const saved = dir.readFileAlloc(io, name, allocator, .limited(32)) catch |err| switch (err) {
+        error.FileNotFound => {
+            const first = try std.math.add(u64, try box.lastRunOrdinal(allocator, run_id), offset);
+            var file = try dir.createFileAtomic(io, name, .{ .permissions = .fromMode(0o600) });
+            defer file.deinit(io);
+            var buffer: [32]u8 = undefined;
+            try file.file.writeStreamingAll(io, try std.fmt.bufPrint(&buffer, "{d}", .{first}));
+            try file.file.sync(io);
+            try file.link(io);
+            try phase3.sync(dir);
+            return first;
+        },
+        else => return err,
+    };
+    defer allocator.free(saved);
+    try phase3.sync(dir);
+    return std.fmt.parseInt(u64, saved, 10);
+}
 
 const Supervisor = struct {
     io: std.Io,
@@ -218,6 +343,7 @@ const Supervisor = struct {
     timeout_at: i128,
     renew_at: i128,
     failure: ?anyerror = null,
+    finalizing: bool = false,
 
     fn init(worker: Handler, ticket: Service.Ticket, run_id: []const u8, expires: i64) !Supervisor {
         const a = worker.service.allocator;
@@ -241,9 +367,11 @@ const Supervisor = struct {
         if (now.monotonic_ns >= self.timeout_at) return error.StandardRunTimeout;
         if (!self.guard.active(now)) return error.LeaseInactive;
         if (now.monotonic_ns < self.renew_at and self.guard.deadline_ns - now.monotonic_ns > 15 * std.time.ns_per_s) return;
-        const expires = try self.channel.renew(&self.identity);
+        const renewed = try self.channel.renew(&self.identity);
         const received = phase3.now(self.io);
         if (!self.guard.active(received)) return error.LeaseInactive;
+        if (renewed.cancel_requested != 0 and !self.finalizing) return error.RunCancellationRequested;
+        const expires = renewed.expires;
         if (expires > self.guard.expires_unix) try self.guard.renew(self.guard.identity, expires, received);
         if (expires < self.guard.expires_unix or self.guard.deadline_ns - received.monotonic_ns <= 15 * std.time.ns_per_s) return error.LeaseInactive;
         if (received.monotonic_ns >= self.timeout_at) return error.StandardRunTimeout;

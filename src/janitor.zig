@@ -89,6 +89,14 @@ pub const Journal = struct {
     /// Recover only resources authenticated by both a durable local intent
     /// and matching Libpod metadata. Image removal is by temporary tag only.
     pub fn sweep(self: Journal, a: std.mem.Allocator, client: podman.Client, stop_fd: ?c_int) !Summary {
+        return self.sweepMatching(a, client, stop_fd, null);
+    }
+
+    pub fn sweepRun(self: Journal, a: std.mem.Allocator, client: podman.Client, stop_fd: ?c_int, run_id: []const u8) !Summary {
+        return self.sweepMatching(a, client, stop_fd, run_id);
+    }
+
+    fn sweepMatching(self: Journal, a: std.mem.Allocator, client: podman.Client, stop_fd: ?c_int, run_id: ?[]const u8) !Summary {
         const dir = self.open() catch |err| switch (err) {
             error.FileNotFound => return .{},
             else => return err,
@@ -119,11 +127,12 @@ pub const Journal = struct {
                     else => return err,
                 };
                 if (record.kind != kind) continue;
+                if (run_id) |run| if (!eq(record.run_id, run)) continue;
                 if (!eq(record.invoker_id, self.invoker_id)) {
                     summary.rejected += 1;
                     continue;
                 }
-                if (eq(record.epoch, self.epoch)) continue;
+                if (run_id == null and eq(record.epoch, self.epoch)) continue;
                 if (!rootless_checked) {
                     const Info = struct { host: struct { security: struct { rootless: bool } } };
                     const info = try std.json.parseFromSliceLeaky(Info, tmp, try client.info(&buf), .{ .ignore_unknown_fields = true });

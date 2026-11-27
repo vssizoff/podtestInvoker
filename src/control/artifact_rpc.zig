@@ -36,7 +36,7 @@ const Grant = extern struct {
     checksum: [44:0]u8,
     length: [20:0]u8,
 };
-const Renewed = extern struct { expires: i64 };
+const Renewed = extern struct { expires: i64, cancel_requested: c_int };
 
 // The C buffers include their terminator; their Zig sentinel is the final slot.
 comptime {
@@ -51,6 +51,7 @@ extern fn podtest_control_create(*anyopaque, *Identity, [*:0]const u8, [*:0]cons
 extern fn podtest_control_complete(*anyopaque, *Identity, [*:0]const u8) c_int;
 extern fn podtest_encode_artifact_event(*Identity, [*:0]const u8, [*:0]const u8, *const [16]u8, u64, i64, [*]u8, usize) usize;
 extern fn podtest_encode_result_event(*Identity, [*:0]const u8, *const ResultFields, *const [16]u8, u64, i64, [*]u8, usize) usize;
+extern fn podtest_encode_progress_event(*Identity, [*:0]const u8, c_uint, ?[*:0]const u8, *const [16]u8, u64, i64, [*]u8, usize) usize;
 extern fn podtest_matches_artifact_event([*]const u8, usize, [*:0]const u8) c_int;
 extern fn podtest_control_report(*anyopaque, [*]const u8, usize) c_int;
 extern fn podtest_control_renew(*anyopaque, *Identity, *Renewed) c_int;
@@ -85,6 +86,25 @@ const ResultFields = extern struct {
     outcome: ?[*:0]const u8 = null,
 };
 
+pub const ProgressEvent = struct {
+    pub const Kind = enum(c_uint) { run_started = 1, build_started = 2, build_finished = 4, test_started = 5 };
+
+    identity: Identity,
+    submission: [:0]const u8,
+    timestamp_ms: i64,
+    kind: Kind,
+    test_id: ?[:0]const u8 = null,
+    buffer: [1024]u8 = undefined,
+
+    pub fn encode(self: *ProgressEvent, run_id: []const u8, sequence: u64, event_id: [16]u8) ![]const u8 {
+        if (!std.mem.eql(u8, run_id, std.mem.span(self.identity.run))) return error.ResultRunMismatch;
+        const test_id: ?[*:0]const u8 = if (self.test_id) |id| id.ptr else null;
+        const len = podtest_encode_progress_event(&self.identity, self.submission, @backingInt(self.kind), test_id, &event_id, sequence, self.timestamp_ms, &self.buffer, self.buffer.len);
+        if (len == 0) return error.EventTooLarge;
+        return self.buffer[0..len];
+    }
+};
+
 pub const ResultEvent = struct {
     identity: Identity,
     submission: [:0]const u8,
@@ -99,6 +119,7 @@ pub const ResultEvent = struct {
         success: [:0]const u8,
         infrastructure_error,
         timeout,
+        cancelled,
     };
 
     pub fn encode(self: *ResultEvent, run_id: []const u8, sequence: u64, event_id: [16]u8) ![]const u8 {
@@ -111,6 +132,7 @@ pub const ResultEvent = struct {
             .success => |verdict| .{ .outcome = "success", .verdict = verdict },
             .infrastructure_error => .{ .outcome = "infrastructure_error" },
             .timeout => .{ .outcome = "timeout" },
+            .cancelled => .{ .outcome = "cancelled" },
         };
         const len = podtest_encode_result_event(&self.identity, self.submission, &fields, &event_id, sequence, self.timestamp_ms, &self.buffer, self.buffer.len);
         if (len == 0) return error.EventTooLarge;
@@ -182,10 +204,10 @@ pub const Channel = struct {
         try status(podtest_control_report(self.handle, wire.ptr, wire.len));
     }
 
-    pub fn renew(self: Channel, identity: *Identity) !i64 {
+    pub fn renew(self: Channel, identity: *Identity) !Renewed {
         var result: Renewed = undefined;
         try status(podtest_control_renew(self.handle, identity, &result));
-        return result.expires;
+        return result;
     }
 
     pub fn claim(self: Channel, identity: *Identity, refresh: bool, out: *Claim) !void {

@@ -29,10 +29,20 @@ _Static_assert(sizeof(struct rpc_boot) == 64, "RPC bootstrap ABI changed");
 _Static_assert(offsetof(struct rpc_request, payload) == 72, "RPC request ABI changed");
 _Static_assert(offsetof(struct rpc_reply, payload) == 32, "RPC reply ABI changed");
 
-enum { RPC_ECHO = 1, RPC_STDOUT_READ = 2, RPC_EOF = 1, RPC_IO_ERROR = 2 };
+enum { RPC_ECHO = 1, RPC_STDOUT_READ = 2, RPC_WORKSPACE_READ = 3,
+    RPC_CONTAINER_OPEN = 4, RPC_CONTAINER_CLOSE = 5, RPC_CONTAINER_STATUS = 6,
+    RPC_TEST_VERDICT = 7, RPC_SUBGROUP_SCORE = 8, RPC_PROBLEM_SCORE = 9,
+    RPC_EOF = 1, RPC_IO_ERROR = 2 };
 typedef int (*rpc_read_fn)(void *, unsigned, char *, size_t *);
+typedef int (*rpc_workspace_read_fn)(void *, const char *, size_t, uint32_t, char *, size_t *);
 typedef int (*rpc_cancel_fn)(void *);
+typedef int (*rpc_dispatch_fn)(void *, unsigned, const char *, size_t, char *, size_t *);
 int podtest_lua_supervise(char *const argv[], const char *script, size_t len, unsigned timeout_ms,
     rpc_read_fn read_stdout, rpc_cancel_fn cancelled, void *context);
+int podtest_lua_supervise_workspace(char *const argv[], const char *script, size_t len, unsigned timeout_ms,
+    rpc_read_fn read_stdout, rpc_workspace_read_fn read_workspace, rpc_cancel_fn cancelled, void *context);
+int podtest_lua_supervise_run(char *const argv[], const char *script, size_t len, unsigned timeout_ms,
+    rpc_read_fn read_stdout, rpc_workspace_read_fn read_workspace, rpc_dispatch_fn dispatch,
+    rpc_cancel_fn cancelled, void *context, int log_fd);
 
 #endif

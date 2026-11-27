@@ -13,6 +13,21 @@ pub const Verdict = report.Verdict;
 pub const TestResult = report.TestResult;
 pub const GroupResult = report.GroupResult;
 
+pub const Progress = struct {
+    pub const Event = union(enum) {
+        build_started,
+        build_finished,
+        test_started: []const u8,
+    };
+
+    context: *anyopaque,
+    emit: *const fn (*anyopaque, Event) anyerror!void,
+
+    fn report(progress: ?Progress, event: Event) !void {
+        if (progress) |observer| try observer.emit(observer.context, event);
+    }
+};
+
 const Log = struct {
     io: std.Io,
     file: std.Io.File,
@@ -31,10 +46,10 @@ const Log = struct {
 /// immutable during the run. Outputs must be a separate, fresh private
 /// directory; only result.json marks a completed run.
 pub fn run(backing: std.mem.Allocator, io: std.Io, client: podman.Client, workspace: std.Io.Dir, outputs: std.Io.Dir, images: Images, cancel: ?podman.Cancellation, ownership: ?group.Ownership) !void {
-    return runSelected(backing, io, client, workspace, outputs, images, null, cancel, ownership);
+    return runSelected(backing, io, client, workspace, outputs, images, null, cancel, ownership, null);
 }
 
-pub fn runSelected(backing: std.mem.Allocator, io: std.Io, client: podman.Client, workspace: std.Io.Dir, outputs: std.Io.Dir, images: Images, requested: ?[]const u8, cancel: ?podman.Cancellation, ownership: ?group.Ownership) !void {
+pub fn runSelected(backing: std.mem.Allocator, io: std.Io, client: podman.Client, workspace: std.Io.Dir, outputs: std.Io.Dir, images: Images, requested: ?[]const u8, cancel: ?podman.Cancellation, ownership: ?group.Ownership, progress: ?Progress) !void {
     var arena = std.heap.ArenaAllocator.init(backing);
     defer arena.deinit();
     const a = arena.allocator();
@@ -83,7 +98,9 @@ pub fn runSelected(backing: std.mem.Allocator, io: std.Io, client: podman.Client
     if (image.Config.OnBuild) |triggers| if (triggers.len != 0) return error.UnsupportedImageOnBuild;
     var nonce: [12]u8 = undefined;
     try io.randomSecure(&nonce);
+    try Progress.report(progress, .build_started);
     const program = if (language == .cpp23) (try compileCpp(a, io, client, outputs, base, source, &log, cancel, ownership)) orelse {
+        try Progress.report(progress, .build_finished);
         try build_log.sync(io);
         return finish(io, a, outputs, .{ .version = 1, .tests = &.{}, .groups = &.{}, .problem_score_milli = 0, .compilation_error = true }, cancel);
     } else source;
@@ -161,6 +178,7 @@ pub fn runSelected(backing: std.mem.Allocator, io: std.Io, client: podman.Client
     };
     const built = try client.buildTrusted(a, &.{ .{ .path = "Dockerfile", .contents = recipe }, .{ .path = "source", .contents = program, .executable = language == .cpp23 } }, tag, 30_000, Log.append, &log, cancellation);
     remove_image = true;
+    try Progress.report(progress, .build_finished);
     try build_log.sync(io);
     const command: []const []const u8 = switch (language) {
         .posix_sh => &.{ "/bin/sh", "/podtest-source" },
@@ -173,6 +191,7 @@ pub fn runSelected(backing: std.mem.Allocator, io: std.Io, client: podman.Client
     const actual = try a.alloc(u8, @intCast(task.limits.output_bytes));
     for (task.tests, payloads, tests, 0..) |item, payload, *result, i| {
         try checkCancel(cancel);
+        try Progress.report(progress, .{ .test_started = item.id });
         const name = try std.fmt.allocPrint(a, "{s}-{d}", .{ tag, i });
         const dir_name = try std.fmt.allocPrint(a, "test-{d}", .{i});
         try outputs.createDir(io, dir_name, .fromMode(0o700));

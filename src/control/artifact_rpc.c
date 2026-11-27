@@ -89,7 +89,7 @@ static int unary(grpc_channel *channel, const char *method, ProtobufCMessage *me
 struct identity { char *invoker, *epoch, *attempt, *run; unsigned char token[32]; };
 struct claim_result { int64_t expires; unsigned char token[32], source_sha[32], bundle_sha[32]; uint64_t source_size, bundle_size; char source[16385], bundle[16385]; };
 struct upload_result { int64_t expires; int complete; char id[121], url[16385], checksum[45], length[21]; };
-struct renewed_result { int64_t expires; };
+struct renewed_result { int64_t expires; int cancel_requested; };
 
 static Lease lease_for(struct identity *id) {
     Lease lease = PODTEST__INVOKER__V1__RUN_LEASE__INIT;
@@ -218,12 +218,24 @@ size_t podtest_encode_artifact_event(struct identity *id, char *submission, char
 
 struct result_fields { char *test_id, *subgroup_id, *verdict, *score, *outcome; };
 
+size_t podtest_encode_progress_event(struct identity *id, char *submission, unsigned int kind, char *test_id,
+        unsigned char event_id[16], uint64_t sequence, int64_t timestamp, unsigned char *out, size_t capacity) {
+    Podtest__Invoker__V1__Event event = PODTEST__INVOKER__V1__EVENT__INIT;
+    event.kind = (Podtest__Invoker__V1__Event__Kind)kind;
+    if (test_id) event.test_id = test_id;
+    return encode_event(event, id, submission, event_id, sequence, timestamp, out, capacity);
+}
+
 size_t podtest_encode_result_event(struct identity *id, char *submission, const struct result_fields *fields,
         unsigned char event_id[16], uint64_t sequence, int64_t timestamp, unsigned char *out, size_t capacity) {
     Podtest__Invoker__V1__Event event = PODTEST__INVOKER__V1__EVENT__INIT;
     if (fields->outcome) {
-        event.kind = PODTEST__INVOKER__V1__EVENT__KIND__RUN_FINISHED;
-        event.outcome = fields->outcome;
+        if (!strcmp(fields->outcome, "cancelled")) {
+            event.kind = PODTEST__INVOKER__V1__EVENT__KIND__RUN_CANCELLED;
+        } else {
+            event.kind = PODTEST__INVOKER__V1__EVENT__KIND__RUN_FINISHED;
+            event.outcome = fields->outcome;
+        }
     } else {
         event.score_presence_case = PODTEST__INVOKER__V1__EVENT__SCORE_PRESENCE_SCORE;
         event.score = fields->score;
@@ -268,6 +280,7 @@ int podtest_control_renew(void *channel, struct identity *id, struct renewed_res
     Podtest__Invoker__V1__RenewLeaseResponse *decoded = podtest__invoker__v1__renew_lease_response__unpack(NULL, n, response);
     if (!decoded) return -1;
     out->expires = decoded->lease_expires_unix;
+    out->cancel_requested = decoded->cancel_requested;
     podtest__invoker__v1__renew_lease_response__free_unpacked(decoded, NULL);
     return out->expires > 0 ? 0 : -1;
 }

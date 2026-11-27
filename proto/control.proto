@@ -86,6 +86,8 @@ message RunLease {
 
 message RenewLeaseResponse {
   int64 lease_expires_unix = 1;
+  // Stop execution and report RUN_CANCELLED after cleanup. Expiry is unchanged.
+  bool cancel_requested = 2;
 }
 
 message CreateArtifactUploadRequest {
